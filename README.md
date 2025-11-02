@@ -1836,7 +1836,433 @@ To add a new platform:
 
 No core library changes required. Platform code is isolated.
 
-## 11. Future Work
+## 11. Testing and Validation
+
+### The Testing Challenge
+
+A policy-based float library presents unique testing challenges:
+
+- **Format variations**: FP8 E5M2, E4M3, FP16, FP32, custom formats
+- **Policy combinations**: Rounding modes, special values, guard bits, error handling
+- **Platform implementations**: C++ reference vs assembly vs ROM routines
+- **Semantic variations**: IEEE compliant vs fast-and-wrong configurations
+
+Testing every permutation manually is infeasible. The solution combines exhaustive testing for small formats with automated policy enumeration.
+
+### Testing as a Policy Dimension
+
+Testing strategy is itself a policy that varies by format:
+
+```cpp
+enum class TestStrategy {
+    Exhaustive,        // Test all possible input combinations
+    EdgePlusSampling,  // Boundary cases + random sampling
+    PropertyBased,     // Algebraic properties only
+    Targeted,          // Hand-picked difficult cases
+    None               // No automated tests
+};
+
+template<TestStrategy Strategy, size_t SampleCount = 10000>
+struct TestingPolicy {
+    static constexpr TestStrategy strategy = Strategy;
+    static constexpr size_t sample_count = SampleCount;
+    
+    // Edge case coverage
+    static constexpr bool test_zero = true;
+    static constexpr bool test_inf = true;
+    static constexpr bool test_nan = true;
+    static constexpr bool test_denormals = true;
+    static constexpr bool test_powers_of_two = true;
+    static constexpr bool test_near_one = true;
+    
+    // Sampling strategy
+    static constexpr bool uniform_sampling = true;
+    static constexpr bool logarithmic_sampling = false;
+};
+
+// Format size determines feasible test strategy
+template<typename Format>
+struct DefaultTestingPolicy {
+    static constexpr TestStrategy strategy = 
+        (Format::total_bits <= 8)  ? TestStrategy::Exhaustive :
+        (Format::total_bits <= 16) ? TestStrategy::EdgePlusSampling :
+                                     TestStrategy::Targeted;
+    
+    static constexpr size_t sample_count = 
+        (Format::total_bits <= 16) ? 1000000 :  // 1M samples for FP16
+        (Format::total_bits <= 32) ? 100000 :   // 100K for FP32
+                                     10000;     // 10K for FP64
+};
+```
+
+Testing policy is included in trait bundles:
+
+```cpp
+struct IEEE754_Binary32_Traits {
+    using format = FormatPolicy<1, 8, 23>;
+    using rounding = RoundingPolicy<ToNearest>;
+    // ... other policies
+    
+    using testing = TestingPolicy<
+        TestStrategy::EdgePlusSampling,
+        100000
+    >;
+};
+```
+
+### Exhaustive Testing for Small Formats
+
+**Key insight**: FP8 and FP16 formats have small enough value spaces to test exhaustively.
+
+**FP8 formats (E5M2, E4M3):**
+- 256 possible values
+- 256 × 256 = 65,536 input pairs per binary operation
+- All operations (add, sub, mul, div) = ~260,000 total tests
+- Runs in seconds on modern hardware
+- **Provides mathematical proof of correctness**
+
+**FP16 (binary16):**
+- 65,536 possible values
+- 4.3 billion input pairs per operation
+- Takes hours but is feasible
+- Can parallelize across CPU cores
+
+**Exhaustive test implementation:**
+
+```cpp
+template<typename Traits>
+void test_exhaustive_fp8() {
+    using Float = FloatEngine<Traits>;
+    using storage_type = typename Traits::format::storage_type;
+    
+    size_t failures = 0;
+    
+    // Test every possible input combination
+    for (uint16_t a_bits = 0; a_bits < 256; a_bits++) {
+        for (uint16_t b_bits = 0; b_bits < 256; b_bits++) {
+            auto a = static_cast<storage_type>(a_bits);
+            auto b = static_cast<storage_type>(b_bits);
+            
+            // Test multiplication
+            auto result = Float::mul(a, b);
+            auto expected = reference_mul<Traits>(a, b);
+            
+            if (result != expected) {
+                log_failure("mul", a, b, result, expected);
+                failures++;
+            }
+            
+            // Test addition
+            result = Float::add(a, b);
+            expected = reference_add<Traits>(a, b);
+            
+            if (result != expected) {
+                log_failure("add", a, b, result, expected);
+                failures++;
+            }
+            
+            // ... test other operations
+        }
+    }
+    
+    if (failures == 0) {
+        std::cout << "PASS: All " << (256*256) << " cases correct\n";
+    } else {
+        std::cout << "FAIL: " << failures << " incorrect results\n";
+    }
+}
+```
+
+**What exhaustive testing proves:**
+
+If exhaustive testing passes for a given trait configuration:
+- The implementation is mathematically correct for those policies
+- No edge cases or corner cases remain untested
+- The code can be trusted for production use
+
+This is much stronger than statistical sampling or random testing.
+
+### Test Execution Based on Policy
+
+The test framework uses the testing policy to select appropriate strategy:
+
+```cpp
+template<typename Traits>
+void run_tests() {
+    if constexpr (Traits::testing::strategy == TestStrategy::Exhaustive) {
+        test_exhaustive<Traits>();
+        
+    } else if constexpr (Traits::testing::strategy == TestStrategy::EdgePlusSampling) {
+        test_edge_cases<Traits>();
+        test_random_samples<Traits>(Traits::testing::sample_count);
+        
+    } else if constexpr (Traits::testing::strategy == TestStrategy::PropertyBased) {
+        test_commutativity<Traits>();
+        test_associativity<Traits>();
+        test_identity<Traits>();
+        
+    } else if constexpr (Traits::testing::strategy == TestStrategy::Targeted) {
+        test_boundary_values<Traits>();
+        test_powers_of_two<Traits>();
+        test_difficult_cases<Traits>();
+    }
+    
+    // Property tests always run as sanity checks
+    if constexpr (Traits::testing::strategy != TestStrategy::None) {
+        verify_basic_properties<Traits>();
+    }
+}
+```
+
+### Compile-Time Policy Enumeration
+
+For larger formats, test representative policy combinations by generating all valid configurations at compile time.
+
+**Cartesian product of policy lists:**
+
+```cpp
+// Define policy dimensions
+using AllFormats = std::tuple<
+    FormatPolicy<1, 5, 2>,   // FP8 E5M2
+    FormatPolicy<1, 4, 3>,   // FP8 E4M3
+    FormatPolicy<1, 5, 10>,  // FP16
+    FormatPolicy<1, 8, 23>   // FP32
+>;
+
+using AllRoundingModes = std::tuple<
+    RoundingPolicy<RoundingMode::ToNearest>,
+    RoundingPolicy<RoundingMode::TowardZero>
+>;
+
+using AllSpecialValues = std::tuple<
+    SpecialValuePolicy<false, false, false, false>,  // No specials
+    SpecialValuePolicy<false, true, false, false>,   // Infinity only
+    SpecialValuePolicy<true, true, true, true>       // Full IEEE 754
+>;
+
+using AllGuardBits = std::tuple<
+    GuardBitsPolicy<0>,
+    GuardBitsPolicy<3>,
+    GuardBitsPolicy<8>
+>;
+
+// Cartesian product: all combinations
+using AllCombinations = CartesianProduct<
+    AllFormats,
+    AllRoundingModes,
+    AllSpecialValues,
+    AllGuardBits
+    // ... more policy dimensions
+>;
+// Results in: 4 × 2 × 3 × 3 = 72 configurations
+```
+
+**The `CartesianProduct` template** can be implemented in ~50-100 lines of template metaprogramming, or use Boost.MP11's `mp_product`. The technique is proven and works in standard C++.
+
+**Filter invalid combinations:**
+
+```cpp
+// Check if a trait bundle is valid
+template<typename Traits>
+struct IsValidConfiguration {
+    static constexpr bool value = 
+        // Rounding constraint
+        (!Traits::rounding::needs_rounding || 
+         Traits::guard_bits::guard_bits > 0) &&
+        
+        // Denormal constraint  
+        (!Traits::specials::has_denormals || 
+         Traits::normalization::normalize_on_pack) &&
+        
+        // Add more constraint checks
+        true;
+};
+
+// Filter to only valid configurations
+template<typename ConfigList>
+using FilterValid = /* filter using IsValidConfiguration */;
+
+using ValidConfigurations = FilterValid<AllCombinations>;
+```
+
+**Compile-time test instantiation:**
+
+```cpp
+// Iterate over all valid configurations at compile time
+template<typename Tuple, typename Func, size_t... Is>
+void for_each_type_impl(Func&& f, std::index_sequence<Is...>) {
+    // C++17 fold expression: call f for each type
+    (f.template operator()<std::tuple_element_t<Is, Tuple>>(), ...);
+}
+
+template<typename Tuple, typename Func>
+void for_each_type(Func&& f) {
+    for_each_type_impl<Tuple>(
+        std::forward<Func>(f), 
+        std::make_index_sequence<std::tuple_size_v<Tuple>>{}
+    );
+}
+
+// Test runner
+template<typename ValidConfigs>
+struct TestRunner {
+    static void run_all() {
+        for_each_type<ValidConfigs>([]<typename Config>() {
+            // Instantiate test for this configuration
+            test_configuration<Config>();
+        });
+    }
+};
+
+// Usage
+int main() {
+    TestRunner<ValidConfigurations>::run_all();
+    // Compiler instantiates test for EVERY valid configuration
+    // Runtime executes them all
+}
+```
+
+**Benefits:**
+
+- All valid configurations tested automatically
+- Invalid configurations fail at compile time (can't accidentally test broken configs)
+- Adding a new policy dimension automatically tests all combinations
+- No manual test case maintenance
+
+**Cost:**
+
+- Compilation time increases (72 configs × test code per config)
+- Binary size increases (each config instantiates ~10KB of test code)
+- For test suites, this is acceptable
+
+### Testing Strategy Summary
+
+**Tier 1: Exhaustive (FP8 formats)**
+- Test every possible input combination
+- Provides mathematical proof of correctness
+- Required for all FP8 trait configurations
+
+**Tier 2: Extensive sampling (FP16)**
+- Exhaustive testing feasible but slow
+- Optional: run overnight or on CI server
+- Provides very high confidence
+
+**Tier 3: Targeted testing (FP32, FP64)**
+- Boundary values (zero, min, max, inf, nan)
+- Powers of 2
+- Values near 1.0
+- Difficult cases (Kahan summation edge cases)
+- Random sampling (10,000-100,000 cases)
+
+**Tier 4: Cross-validation**
+- Fast config tested against accurate config
+- Accurate config tested against IEEE config  
+- Platform assembly tested against C++ reference
+- Each tier builds confidence in the next
+
+**Tier 5: Property testing**
+- Commutativity: a + b == b + a
+- Associativity: (a + b) + c ≈ a + (b + c) within tolerance
+- Identity: a + 0 == a, a × 1 == a, a × 0 == 0
+- Monotonicity: if a < b and c > 0, then a×c < b×c
+- Sign preservation: sign(a × b) == sign(a) × sign(b)
+
+Properties hold regardless of precision or rounding mode (within tolerance).
+
+### Reference Implementations
+
+Each test needs a reference implementation to compare against:
+
+**For IEEE-compliant configurations:**
+- Compare against language built-in float/double (if same format)
+- Compare against MPFR (arbitrary precision library)
+- Compare against SoftFloat (Berkeley software float)
+
+**For non-IEEE configurations:**
+- C++ template implementation serves as reference
+- Higher precision configuration serves as reference (FP8 → FP16 → FP32)
+- Mathematically computed expected values for simple cases
+
+**For platform-specific implementations:**
+- Assembly version tested against C++ reference
+- Both should produce identical bit patterns for same traits
+
+### Continuous Integration
+
+Recommended CI pipeline:
+
+```yaml
+# .github/workflows/test.yml (example)
+- name: Exhaustive FP8 tests
+  run: |
+    ./run_tests --exhaustive --format=fp8
+    # ~260K tests, runs in seconds
+
+- name: Extensive FP16 tests  
+  run: |
+    ./run_tests --extensive --format=fp16
+    # Billions of tests, runs for hours
+  # Only on nightly builds or release branches
+
+- name: Policy enumeration tests
+  run: |
+    ./run_tests --all-configs --format=fp32
+    # All valid policy combinations
+
+- name: Platform validation
+  run: |
+    ./run_tests --platform=mos6502 --validate-asm
+    # Compare assembly against C++ reference
+```
+
+### Test Organization
+
+Tests are automatically generated from policy combinations:
+
+```
+tests/
+  generated_tests.cpp       # All trait combinations generated via CartesianProduct
+  reference/
+    mpfr_reference.cpp      # High-precision reference for validation
+    softfloat_reference.cpp # IEEE 754 software reference
+  platform/
+    validate_asm.cpp        # Platform-specific implementation validation
+  properties/
+    arithmetic_laws.cpp     # Algebraic property tests (always run)
+```
+
+Each trait configuration includes its testing policy, so the test framework automatically:
+- Uses exhaustive testing for FP8 formats
+- Uses edge-plus-sampling for FP16
+- Uses targeted testing for FP32 and larger
+- Validates platform implementations against C++ reference
+
+No manual test file creation needed - everything is generated from the Cartesian product of policies.
+
+### Validation Confidence Levels
+
+After running the full test suite:
+
+**FP8 formats with exhaustive testing:**
+- Confidence: Mathematical proof
+- Can be used in production without reservation
+
+**FP16 with extensive testing:**  
+- Confidence: Extremely high (billions of test cases)
+- Suitable for production use
+
+**FP32 with targeted testing:**
+- Confidence: High (boundary cases + sampling + properties)
+- Suitable for production with standard validation practices
+
+**Platform-specific implementations:**
+- Confidence: Depends on coverage
+- Assembly must match C++ reference bit-for-bit
+- Any mismatch is a bug in assembly or calling convention
+
+The combination of exhaustive testing (where feasible), automated policy enumeration, and cross-validation provides strong confidence in library correctness across the entire policy space.
+
+## 12. Future Work
 
 ### Transcendental Functions
 
@@ -1929,6 +2355,12 @@ Would require additional policy dimension for vector width.
 
 - `OperationSetPolicy<Ops>`: Which operations are available
 - `ImplementationPolicy<Ops>`: Where implementations come from
+
+**Testing**
+
+- `TestingPolicy<Strategy, SampleCount>`: Testing approach and coverage
+- `TestStrategy`: Exhaustive, EdgePlusSampling, PropertyBased, Targeted, None
+- Default strategy automatically selected based on format size
 
 ### B. Policy Interactions
 
