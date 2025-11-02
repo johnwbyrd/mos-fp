@@ -1836,7 +1836,865 @@ To add a new platform:
 
 No core library changes required. Platform code is isolated.
 
-## 11. Testing and Validation
+## 11. Format Conversion
+
+### The Conversion Problem
+
+Converting between floating point formats is critical for modern applications:
+
+**Machine learning workflows:**
+- Training in FP32, inference in FP8
+- Mixed-precision training (FP32 ↔ FP16)
+- Quantization (FP32 → FP8/FP6/FP4)
+
+**Legacy integration:**
+- Converting between IEEE 754 and historical formats
+- Apple II format ↔ modern formats
+- Microsoft BASIC format ↔ standard formats
+
+**Format experimentation:**
+- Researchers testing E4M3 vs E5M2 vs E3M4
+- Evaluating custom formats for specific domains
+- Optimizing format choice per layer in neural networks
+
+Conversion is complex because formats differ in:
+- **Range** (different exponent bits)
+- **Precision** (different mantissa bits)
+- **Special values** (NaN, Inf, denormals present or absent)
+- **Conventions** (signed zeros, exponent bias, FNUZ variants)
+
+### User Interface
+
+Conversions should require minimal code:
+
+```cpp
+// Implicit conversion (uses default policy)
+FloatEngine<FP32_Traits> src = ...;
+FloatEngine<FP8_E4M3_Traits> dst = src;  // Just works
+
+// Explicit conversion
+auto dst = static_cast<FloatEngine<FP8_E4M3_Traits>>(src);
+
+// With custom conversion policy
+auto dst = src.convert_to<FP8_E4M3_Traits, StrictConversionPolicy>();
+
+// Free function form
+auto dst = convert<FP8_E4M3_Traits>(src);
+auto dst = convert<FP8_E4M3_Traits, CustomPolicy>(src);
+```
+
+### Conversion Policies
+
+Conversion behavior is controlled by policies covering four dimensions:
+
+**1. Range Handling**
+
+What happens when source value exceeds destination range:
+
+```cpp
+enum class OverflowMode {
+    Saturate,     // Clip to destination max value
+    ToInfinity,   // Convert to Inf (if dest supports it)
+    Error         // Signal error via chosen mechanism
+};
+
+enum class UnderflowMode {
+    FlushToZero,  // Convert to zero
+    ToDenormal,   // Use denormal representation (if dest supports it)
+    Error         // Signal error
+};
+
+template<OverflowMode Overflow, UnderflowMode Underflow>
+struct RangePolicy {
+    static constexpr OverflowMode overflow = Overflow;
+    static constexpr UnderflowMode underflow = Underflow;
+};
+```
+
+**2. Special Value Mapping**
+
+How to map special values when destination doesn't support them:
+
+```cpp
+struct SpecialMappingPolicy {
+    enum class NaNMapping {
+        Preserve,   // Keep as NaN if dest supports it
+        ToMax,      // Convert to max representable value
+        ToZero,     // Convert to zero
+        Error       // Signal error
+    };
+    
+    enum class InfMapping {
+        Preserve,   // Keep as Inf if dest supports it
+        ToMax,      // Convert to max representable value
+        Error       // Signal error
+    };
+    
+    enum class DenormalMapping {
+        Preserve,   // Keep as denormal if dest supports it
+        FlushToZero, // Convert to zero
+        Error       // Signal error
+    };
+    
+    static constexpr NaNMapping nan_mapping = ...;
+    static constexpr InfMapping inf_mapping = ...;
+    static constexpr DenormalMapping denormal_mapping = ...;
+};
+```
+
+**3. Precision Handling**
+
+When narrowing mantissa (e.g., FP32 23 bits → FP8 3 bits):
+
+```cpp
+struct PrecisionPolicy {
+    using rounding = RoundingPolicy<...>;      // How to round
+    using guard_bits = GuardBitsPolicy<...>;   // Intermediate precision
+};
+```
+
+Typically uses destination format's rounding policy, but can be overridden.
+
+**4. Error Handling**
+
+How to report conversion errors:
+
+```cpp
+enum class ConversionErrorMode {
+    Silent,         // Map to valid value, continue
+    SetFlag,        // Set thread-local status flag
+    Exception,      // Throw C++ exception
+    CompileError    // static_assert (when detectable at compile time)
+};
+
+template<ConversionErrorMode Mode>
+struct ConversionErrorPolicy {
+    static constexpr ConversionErrorMode mode = Mode;
+    
+    // What conditions trigger errors
+    static constexpr bool nan_is_error = false;
+    static constexpr bool inf_is_error = false;
+    static constexpr bool overflow_is_error = false;
+    static constexpr bool underflow_is_error = false;
+};
+```
+
+### Preset Conversion Policy Bundles
+
+Most users won't configure individual policies. Preset bundles cover common cases:
+
+```cpp
+// Safe: correctness over speed (default)
+struct SafeConversionPolicy {
+    using range = RangePolicy<
+        OverflowMode::Saturate,
+        UnderflowMode::FlushToZero
+    >;
+    using specials = SpecialMappingPolicy<
+        NaNMapping::Preserve,
+        InfMapping::Preserve,
+        DenormalMapping::Preserve
+    >;
+    using precision = PrecisionPolicy<
+        RoundingPolicy<RoundingMode::ToNearest>,
+        GuardBitsPolicy<3>
+    >;
+    using error_policy = ConversionErrorPolicy<
+        ConversionErrorMode::Silent
+    >;
+};
+
+// Strict: error on any potential data loss
+struct StrictConversionPolicy {
+    using range = RangePolicy<
+        OverflowMode::Error,
+        UnderflowMode::Error
+    >;
+    using specials = SpecialMappingPolicy<
+        NaNMapping::Error,
+        InfMapping::Error,
+        DenormalMapping::Error
+    >;
+    using precision = PrecisionPolicy<
+        RoundingPolicy<RoundingMode::ToNearest>,
+        GuardBitsPolicy<3>
+    >;
+    using error_policy = ConversionErrorPolicy<
+        ConversionErrorMode::Exception
+    >;
+};
+
+// Fast: performance over exactness
+struct FastConversionPolicy {
+    using range = RangePolicy<
+        OverflowMode::Saturate,
+        UnderflowMode::FlushToZero
+    >;
+    using specials = SpecialMappingPolicy<
+        NaNMapping::ToMax,        // Skip NaN checks
+        InfMapping::ToMax,        // Skip Inf checks
+        DenormalMapping::FlushToZero
+    >;
+    using precision = PrecisionPolicy<
+        RoundingPolicy<RoundingMode::TowardZero>,  // Truncate
+        GuardBitsPolicy<0>
+    >;
+    using error_policy = ConversionErrorPolicy<
+        ConversionErrorMode::Silent
+    >;
+};
+
+// ML inference: training weights → inference weights
+struct MLInferenceConversionPolicy {
+    using range = RangePolicy<
+        OverflowMode::Saturate,   // Clip outliers
+        UnderflowMode::FlushToZero
+    >;
+    using specials = SpecialMappingPolicy<
+        NaNMapping::Error,        // NaN in weights indicates bug
+        InfMapping::ToMax,
+        DenormalMapping::FlushToZero
+    >;
+    using precision = PrecisionPolicy<
+        RoundingPolicy<RoundingMode::ToNearest>,
+        GuardBitsPolicy<3>
+    >;
+    using error_policy = ConversionErrorPolicy<
+        ConversionErrorMode::Exception
+    >;
+};
+```
+
+### Conversion Algorithm
+
+The generic conversion algorithm:
+
+1. **Unpack source** - extract sign, exponent, mantissa, special flags
+2. **Handle special values** - NaN, Inf, zero (policy-driven)
+3. **Adjust exponent bias** - convert from source bias to dest bias
+4. **Check range** - detect overflow/underflow (policy-driven)
+5. **Convert mantissa** - widen (shift left) or narrow (round)
+6. **Handle mantissa overflow** - rounding can cause mantissa overflow
+7. **Pack destination** - assemble result in destination format
+
+**Critical cases:**
+
+**Widening mantissa (FP8 → FP32):**
+- Shift left, pad with zeros
+- Exact conversion, no information loss
+
+**Narrowing mantissa (FP32 → FP8):**
+- Extract guard, round, sticky bits
+- Apply rounding policy
+- Check for mantissa overflow after rounding
+- If mantissa overflows, increment exponent and check for exponent overflow
+
+**Exponent adjustment:**
+- Unbias source exponent: `exp - source_bias`
+- Rebias for destination: `(exp - source_bias) + dest_bias`
+- Check result against destination exponent range
+
+**Special value mapping:**
+- Source NaN → Dest NaN (if supported), else max value or error
+- Source Inf → Dest Inf (if supported), else max value or error
+- Source denormal → Dest denormal (if supported), else flush to zero
+- Signed zero handling: map ±0 appropriately for FNUZ formats
+
+### Platform-Specific Conversion Implementations
+
+Like arithmetic operations, conversions can have platform-specific optimizations:
+
+```cpp
+// Generic conversion (works everywhere)
+template<typename SrcTraits, typename DstTraits, typename ConvPolicy>
+struct GenericConversion {
+    static typename DstTraits::format::storage_type
+    convert(typename SrcTraits::format::storage_type src) {
+        // Full algorithm: unpack, convert, pack
+    }
+};
+
+// Platform-optimized conversion
+template<typename SrcTraits, typename DstTraits, typename ConvPolicy>
+struct MOS6502_E5M2_to_E4M3_Conversion {
+    static uint8_t convert(uint8_t src) {
+        // Lookup table approach
+        // E5M2 → E4M3 is 256-entry table
+        extern const uint8_t e5m2_to_e4m3_table[256];
+        return e5m2_to_e4m3_table[src];
+    }
+};
+
+// Conversion implementation selector
+template<typename SrcTraits, typename DstTraits, typename ConvPolicy>
+struct ConversionImplementation {
+    using type = GenericConversion<SrcTraits, DstTraits, ConvPolicy>;
+};
+
+// Specialization for optimized case
+template<>
+struct ConversionImplementation<
+    E5M2_Traits, 
+    E4M3_Traits, 
+    SafeConversionPolicy
+> {
+    using type = MOS6502_E5M2_to_E4M3_Conversion<
+        E5M2_Traits, 
+        E4M3_Traits, 
+        SafeConversionPolicy
+    >;
+};
+```
+
+**Benefits:**
+- FP8 ↔ FP8 conversions can use lookup tables (256 or 65K entries)
+- Platform-specific bit manipulation tricks
+- SIMD implementations for batch conversions
+- No changes to user code
+
+### Error Handling Mechanisms
+
+**Silent mode (default):**
+```cpp
+FP8 dst = fp32_src;  // Overflow → saturate to max, no error signal
+```
+
+**Exception mode:**
+```cpp
+try {
+    auto dst = src.convert_to<FP8_Traits, StrictConversionPolicy>();
+} catch (const ConversionException& e) {
+    // Handle overflow, underflow, NaN conversion, etc.
+}
+```
+
+**Status flag mode:**
+```cpp
+ConversionStatus::clear();
+FP8 dst = fp32_src;  // Uses policy with SetFlag mode
+
+if (ConversionStatus::get_error() != ConversionStatus::Error::None) {
+    // Handle error
+}
+```
+
+**Compile-time error mode:**
+```cpp
+// If source always has NaN and dest never does, and policy treats as error:
+struct NeverNaN_Traits {
+    using specials = SpecialValuePolicy<false, false, false, false>;
+};
+
+struct AlwaysNaN_Source {
+    using specials = SpecialValuePolicy<true, true, true, true>;
+};
+
+// This would fail at compile time with appropriate policy:
+// NeverNaN dst = always_nan_src;  // static_assert fires
+```
+
+### Conversion Testing
+
+Conversions must be tested as thoroughly as operations:
+
+**Exhaustive testing for FP8:**
+- All 256 values in source format
+- Convert to destination format
+- Verify against reference implementation
+- Test all policy combinations
+
+**Round-trip testing:**
+```cpp
+// FP32 → FP8 → FP32 should be "close"
+for (auto original : test_values) {
+    auto fp8 = convert<FP8_Traits>(original);
+    auto back = convert<FP32_Traits>(fp8);
+    assert(approximately_equal(original, back, tolerance));
+}
+```
+
+**Monotonicity testing:**
+```cpp
+// If a < b, then convert(a) ≤ convert(b)
+assert(convert(a) <= convert(b));
+```
+
+**Property testing:**
+- Conversion preserves sign (except for special cases)
+- Conversion preserves ordering (monotonicity)
+- Special values map correctly
+
+**Cross-validation:**
+- Generic implementation vs platform-optimized implementation
+- Different policy combinations produce expected different results
+
+### Conversion Matrix
+
+For N formats, need N² conversion functions. These are generated automatically:
+
+```cpp
+using AllFormats = std::tuple<
+    FP8_E4M3_Traits,
+    FP8_E5M2_Traits,
+    FP8_E4M3FNUZ_Traits,
+    FP8_E5M2FNUZ_Traits,
+    FP16_Traits,
+    BFloat16_Traits,
+    FP32_Traits,
+    FP64_Traits
+>;
+
+// Generates 8×8 = 64 conversion functions
+// (including identity conversions which are no-ops)
+template<typename FormatList>
+struct GenerateAllConversions;
+```
+
+Each conversion function is instantiated on first use. Dead conversions eliminated by linker.
+
+### Real-World Use Cases
+
+**ML model quantization:**
+```cpp
+// Load FP32 training weights
+std::vector<FP32> training_weights = load_model();
+
+// Quantize to FP8 for inference
+std::vector<FP8_E4M3> inference_weights;
+for (auto w : training_weights) {
+    inference_weights.push_back(convert<FP8_E4M3_Traits>(w));
+}
+```
+
+**Format experimentation:**
+```cpp
+// Test different formats for a layer
+auto accuracy_e4m3 = benchmark_layer<FP8_E4M3>(data);
+auto accuracy_e5m2 = benchmark_layer<FP8_E5M2>(data);
+auto accuracy_e3m4 = benchmark_layer<FP8_E3M4>(data);
+
+// Pick best format
+using BestFormat = /* format with highest accuracy */;
+```
+
+**Mixed-precision inference:**
+```cpp
+// Some layers in FP8, some in FP16
+FP8_E4M3 conv_output = conv_layer_fp8(input);
+FP16 attention_output = attention_layer_fp16(
+    convert<FP16_Traits>(conv_output)
+);
+FP8_E4M3 final = convert<FP8_E4M3_Traits>(attention_output);
+```
+
+### Format Compatibility Notes
+
+**FNUZ variants (Finite Numbers, Unsigned Zero):**
+- No infinity: overflow saturates to max value
+- No negative zero: only one zero representation
+- Non-standard exponent bias
+- Requires special handling in conversions
+
+**Conversion examples:**
+```cpp
+// IEEE 754 → FNUZ: Inf becomes max value
+FP8_E4M3FNUZ dst = fp32_inf;  // → max representable value
+
+// FNUZ → IEEE 754: can add Inf if overflow
+FP32 dst = fp8_fnuz_max;  // → stays at max (no Inf unless overflow)
+
+// Signed zero → unsigned zero
+FP8_E4M3FNUZ dst = fp32_negative_zero;  // → positive zero
+```
+
+The conversion system handles these variants through policy configuration and format trait specifications.
+
+## 12. Microscaling (MX) Formats
+
+### The Microscaling Concept
+
+Microscaling (MX) is a compression technique that groups values into blocks with a shared scale factor. Instead of each value having its own exponent, a block of values shares a single exponent while maintaining individual mantissas.
+
+**Key insight:** Most tensor values in a local region have similar magnitudes. Sharing an exponent across a block saves bits while maintaining acceptable precision.
+
+**MX Format Structure:**
+- **Element type**: The data type for individual values (e.g., FP8 E4M3, FP6, INT8)
+- **Scale type**: The data type for the shared scale factor (typically E8M0)
+- **Block size**: Number of consecutive elements sharing one scale (typically 32)
+
+**Example: MXFP8 with E4M3 elements**
+- 32 FP8 E4M3 values: 32 × 8 = 256 bits
+- 1 shared E8M0 scale: 8 bits
+- Total: 264 bits for 32 values
+- Compared to individual E4M3: 32 × 8 = 256 bits (but worse dynamic range)
+- Compared to FP32: 32 × 32 = 1024 bits
+
+### MX Format Specification
+
+An MX-compliant format consists of:
+- Scale (X) data type / encoding (w bits)
+- Private elements (Pᵢ) data type / encoding (d bits each)
+- Scaling block size (k)
+
+Each block of k elements is encoded in (w + kd) bits.
+
+**Decoding values:**
+Given scale X and elements P₁, P₂, ..., Pₖ:
+
+- If X = NaN, then vᵢ = NaN for all i (entire block is NaN)
+- If X ≠ NaN:
+  - If Pᵢ ∈ {Inf, NaN}, then vᵢ = Pᵢ (element special values preserved)
+  - Otherwise, vᵢ = X × Pᵢ (scale times element value)
+
+If X × Pᵢ exceeds float32 range, behavior is implementation-defined (saturate, error, or Inf).
+
+### Standard MX Formats
+
+| Format Name | Element Type | Element Bits | Block Size | Scale Type | Scale Bits |
+|-------------|-------------|--------------|------------|------------|------------|
+| MXFP8 (E5M2) | FP8 E5M2 | 8 | 32 | E8M0 | 8 |
+| MXFP8 (E4M3) | FP8 E4M3 | 8 | 32 | E8M0 | 8 |
+| MXFP6 (E3M2) | FP6 E3M2 | 6 | 32 | E8M0 | 8 |
+| MXFP6 (E2M3) | FP6 E2M3 | 6 | 32 | E8M0 | 8 |
+| MXFP4 | FP4 E2M1 | 4 | 32 | E8M0 | 8 |
+| MXINT8 | INT8 | 8 | 32 | E8M0 | 8 |
+
+**Note:** MXFP8 has two variants (E5M2 and E4M3) which are considered different formats.
+
+### E8M0 Scale Format
+
+The E8M0 format represents pure powers of 2:
+- 8-bit exponent, 0-bit mantissa
+- No sign bit (scales are always positive powers of 2)
+- Value = 2^(exponent - bias), where bias = 127
+- Can represent scales from 2^-127 to 2^128
+
+```cpp
+struct E8M0_Traits {
+    using format = FormatPolicy<0, 8, 0>;  // No sign, 8-bit exp, no mantissa
+    static constexpr int exponent_bias = 127;
+};
+
+// E8M0 represents a power-of-2 scale factor
+float scale_value = std::pow(2.0f, exponent - 127);
+```
+
+### Microscaling Policy
+
+MX formats are defined by three parameters:
+
+```cpp
+template<
+    typename ElementTraits,    // Type of individual elements
+    typename ScaleTraits,      // Type of shared scale factor
+    int BlockSize              // Elements per block
+>
+struct MicroscalingPolicy {
+    using element_traits = ElementTraits;
+    using scale_traits = ScaleTraits;
+    static constexpr int block_size = BlockSize;
+    
+    // Derived properties
+    static constexpr int element_bits = ElementTraits::format::total_bits;
+    static constexpr int scale_bits = ScaleTraits::format::total_bits;
+    static constexpr int bits_per_block = scale_bits + (block_size * element_bits);
+    
+    // Scale selection strategy
+    enum class ScaleStrategy {
+        MaxAbsValue,     // Scale to fit largest absolute value
+        RMS,             // Root mean square
+        Percentile99     // 99th percentile (ignore outliers)
+    };
+    static constexpr ScaleStrategy scale_strategy = ScaleStrategy::MaxAbsValue;
+};
+```
+
+**Standard format definitions:**
+
+```cpp
+// MXFP8 with E4M3 elements
+using MXFP8_E4M3 = MicroscalingPolicy<
+    E4M3_Traits,
+    E8M0_Traits,
+    32
+>;
+
+// MXFP8 with E5M2 elements
+using MXFP8_E5M2 = MicroscalingPolicy<
+    E5M2_Traits,
+    E8M0_Traits,
+    32
+>;
+
+// MXFP6 with E3M2 elements
+using MXFP6_E3M2 = MicroscalingPolicy<
+    E3M2_Traits,
+    E8M0_Traits,
+    32
+>;
+
+// MXFP4
+using MXFP4 = MicroscalingPolicy<
+    E2M1_Traits,
+    E8M0_Traits,
+    32
+>;
+```
+
+### MX Tensor Container
+
+MX formats are storage/compression schemes, not numeric types. They are implemented as containers:
+
+```cpp
+template<typename MXPolicy>
+class MXTensor {
+private:
+    struct Block {
+        FloatEngine<typename MXPolicy::scale_traits> scale;
+        FloatEngine<typename MXPolicy::element_traits> 
+            elements[MXPolicy::block_size];
+    };
+    
+    std::vector<Block> blocks_;
+    size_t size_;
+    
+public:
+    MXTensor(size_t size);
+    
+    // Access individual elements (decompresses on read)
+    float get(size_t index) const;
+    
+    // Set individual elements (may trigger re-quantization)
+    void set(size_t index, float value);
+    
+    // Batch operations
+    void set_block(size_t block_idx, std::span<const float> values);
+    std::span<const float> get_block(size_t block_idx) const;
+    
+    size_t size() const { return size_; }
+    size_t num_blocks() const { return blocks_.size(); }
+};
+```
+
+**Dequantization algorithm (get):**
+
+```cpp
+template<typename MXPolicy>
+float MXTensor<MXPolicy>::get(size_t index) const {
+    size_t block_idx = index / MXPolicy::block_size;
+    size_t elem_idx = index % MXPolicy::block_size;
+    
+    auto& block = blocks_[block_idx];
+    
+    // Handle NaN scale: entire block is NaN
+    if (block.scale.is_nan()) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    
+    auto elem = block.elements[elem_idx];
+    
+    // Preserve element special values
+    if (elem.is_inf() || elem.is_nan()) {
+        return elem.to_float();
+    }
+    
+    // Compute v_i = X × P_i
+    float scale_value = std::pow(2.0f, block.scale.exponent() - 127);
+    float elem_value = elem.to_float();
+    float result = scale_value * elem_value;
+    
+    // Handle overflow (implementation-defined)
+    if (std::abs(result) > std::numeric_limits<float>::max()) {
+        return std::copysign(std::numeric_limits<float>::max(), result);
+    }
+    
+    return result;
+}
+```
+
+**Quantization algorithm (set_block):**
+
+```cpp
+template<typename MXPolicy>
+void MXTensor<MXPolicy>::set_block(
+    size_t block_idx, 
+    std::span<const float> values
+) {
+    // Step 1: Find optimal scale for block
+    float max_abs = 0.0f;
+    for (float v : values) {
+        if (std::isfinite(v)) {
+            max_abs = std::max(max_abs, std::abs(v));
+        }
+    }
+    
+    // Step 2: Determine scale as power of 2
+    // Scale chosen so max value fits in element range
+    using ElemTraits = typename MXPolicy::element_traits;
+    constexpr float elem_max = /* max representable in element type */;
+    
+    int scale_exp = std::ceil(std::log2(max_abs / elem_max)) + 127;
+    scale_exp = std::clamp(scale_exp, 0, 255);
+    
+    blocks_[block_idx].scale = 
+        FloatEngine<typename MXPolicy::scale_traits>::from_bits(scale_exp);
+    
+    // Step 3: Quantize each element
+    float scale_value = std::pow(2.0f, scale_exp - 127);
+    
+    for (size_t i = 0; i < values.size(); i++) {
+        float scaled = values[i] / scale_value;
+        blocks_[block_idx].elements[i] = 
+            convert<ElemTraits>(scaled);
+    }
+}
+```
+
+### Quantization and Dequantization Functions
+
+```cpp
+// Quantize float array to MX format
+template<typename MXPolicy, typename QuantPolicy = DefaultQuantPolicy>
+MXTensor<MXPolicy> quantize(std::span<const float> values) {
+    MXTensor<MXPolicy> result(values.size());
+    
+    size_t num_blocks = (values.size() + MXPolicy::block_size - 1) 
+                       / MXPolicy::block_size;
+    
+    for (size_t b = 0; b < num_blocks; b++) {
+        size_t start = b * MXPolicy::block_size;
+        size_t end = std::min(start + MXPolicy::block_size, values.size());
+        
+        result.set_block(b, values.subspan(start, end - start));
+    }
+    
+    return result;
+}
+
+// Dequantize MX format to float array
+template<typename MXPolicy>
+std::vector<float> dequantize(const MXTensor<MXPolicy>& tensor) {
+    std::vector<float> result(tensor.size());
+    
+    for (size_t i = 0; i < tensor.size(); i++) {
+        result[i] = tensor.get(i);
+    }
+    
+    return result;
+}
+
+// Convert between MX formats
+template<typename DstMXPolicy, typename SrcMXPolicy>
+MXTensor<DstMXPolicy> convert_mx(const MXTensor<SrcMXPolicy>& src) {
+    // Dequantize to float, re-quantize to new format
+    auto float_values = dequantize(src);
+    return quantize<DstMXPolicy>(float_values);
+}
+```
+
+### Real-World Use Cases
+
+**ML Model Quantization:**
+
+```cpp
+// Training weights in FP32
+std::vector<float> training_weights = load_model();
+
+// Quantize to MXFP8 for inference
+MXTensor<MXFP8_E4M3> inference_weights = quantize<MXFP8_E4M3>(training_weights);
+
+// Later: dequantize for computation
+auto weights_fp32 = dequantize(inference_weights);
+```
+
+**Mixed Precision Storage:**
+
+```cpp
+// Store activations in MXFP6, weights in MXFP8
+MXTensor<MXFP6_E3M2> activations = quantize<MXFP6_E3M2>(activation_data);
+MXTensor<MXFP8_E4M3> weights = quantize<MXFP8_E4M3>(weight_data);
+
+// Compute in FP16 or FP32
+auto act_fp32 = dequantize(activations);
+auto wgt_fp32 = dequantize(weights);
+// ... perform computation ...
+```
+
+**Format Experimentation:**
+
+```cpp
+// Test different MX formats for a layer
+auto loss_e4m3 = evaluate_layer(quantize<MXFP8_E4M3>(weights));
+auto loss_e5m2 = evaluate_layer(quantize<MXFP8_E5M2>(weights));
+auto loss_fp6  = evaluate_layer(quantize<MXFP6_E3M2>(weights));
+
+// Choose format with best accuracy
+```
+
+### Advantages of MX Formats
+
+**Improved dynamic range:**
+- FP8 with per-tensor scale: all values must fit in FP8 range
+- MXFP8 with per-block scale: each block can use different scale
+- Allows E4M3 (better precision) instead of E5M2 (better range)
+
+**Compression efficiency:**
+- Better than per-tensor quantization (more scales)
+- Less overhead than per-element full floats
+- Sweet spot for tensor data with local magnitude similarity
+
+**Hardware efficiency:**
+- Shared exponent simplifies hardware
+- NVIDIA H100 has native MXFP8 support
+- Vectorized operations benefit from uniform block structure
+
+### Integration with Library
+
+MX formats leverage existing infrastructure:
+
+**Element types use existing FloatEngine:**
+- E4M3, E5M2, E3M2, E2M1 are already supported
+- No new float operations needed
+
+**Scale type is just another format:**
+- E8M0 is a valid (if unusual) float format
+- Uses same FormatPolicy structure
+
+**Conversion system handles quantization:**
+- Quantization uses existing convert<> infrastructure
+- Scale finding is the only new logic
+
+**Testing applies:**
+- Round-trip testing: float → MX → float
+- Block-level exhaustive testing for small formats
+- Property testing: monotonicity, scale correctness
+
+### Custom MX Formats
+
+Users can define custom MX formats using the policy system:
+
+```cpp
+// Custom: 16-bit elements, 64 per block
+using CustomMX = MicroscalingPolicy<
+    FP16_Traits,    // 16-bit elements
+    E8M0_Traits,    // Standard scale
+    64              // Larger blocks
+>;
+
+// Custom: 4-bit elements, smaller blocks
+using TinyMX = MicroscalingPolicy<
+    FP4_E2M1_Traits,
+    E8M0_Traits,
+    16              // Smaller blocks for better adaptation
+>;
+
+// Use like standard formats
+MXTensor<CustomMX> my_tensor = quantize<CustomMX>(data);
+```
+
+The microscaling policy system provides production-ready support for NVIDIA's MX formats while maintaining flexibility for experimentation and custom formats.
+
+## 13. Testing and Validation
 
 ### The Testing Challenge
 
@@ -2262,7 +3120,7 @@ After running the full test suite:
 
 The combination of exhaustive testing (where feasible), automated policy enumeration, and cross-validation provides strong confidence in library correctness across the entire policy space.
 
-## 12. Future Work
+## 14. Future Work
 
 ### Transcendental Functions
 
@@ -2361,6 +3219,25 @@ Would require additional policy dimension for vector width.
 - `TestingPolicy<Strategy, SampleCount>`: Testing approach and coverage
 - `TestStrategy`: Exhaustive, EdgePlusSampling, PropertyBased, Targeted, None
 - Default strategy automatically selected based on format size
+
+**Conversion**
+
+- `ConversionPolicy`: Bundle of conversion-specific policies
+- `RangePolicy<Overflow, Underflow>`: Overflow/underflow handling
+- `SpecialMappingPolicy<NaN, Inf, Denormal>`: Special value mapping
+- `PrecisionPolicy<Rounding, GuardBits>`: Mantissa conversion precision
+- `ConversionErrorPolicy<Mode>`: Error detection and reporting
+- Preset bundles: SafeConversionPolicy, StrictConversionPolicy, FastConversionPolicy, MLInferenceConversionPolicy
+
+**Microscaling**
+
+- `MicroscalingPolicy<ElementTraits, ScaleTraits, BlockSize>`: MX format definition
+- Element type: The numeric format for individual values (E4M3, E5M2, E3M2, E2M1, INT8, etc.)
+- Scale type: Usually E8M0 (pure power-of-2 exponent)
+- Block size: Typically 32 elements
+- Standard formats: MXFP8_E4M3, MXFP8_E5M2, MXFP6_E3M2, MXFP6_E2M3, MXFP4, MXINT8
+- Container: MXTensor<MXPolicy> for compressed storage
+- Operations: quantize<MXPolicy>(), dequantize(), convert_mx()
 
 ### B. Policy Interactions
 
