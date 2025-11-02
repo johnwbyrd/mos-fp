@@ -1,962 +1,595 @@
 # Policy-Based Floating Point Library Design
 
-## 1. Introduction
+## Part I: Introduction and Motivation
 
-This document describes the design of a floating point library for C++ that uses policy-based design to support arbitrary float formats on resource-constrained and specialized platforms.
+### 1. The Universal Float Problem
 
-### What This Library Does
+Modern computing spans an enormous range of platforms and requirements:
 
-Provides floating point arithmetic operations (add, subtract, multiply, divide) for formats that may differ from IEEE 754 standard floats. Supports platforms ranging from 8-bit microprocessors with no hardware multiply to modern processors with SIMD units.
+**The spectrum:**
+- **Retro computing**: 6502 at 1 MHz, no hardware multiply, 64KB total RAM
+- **Embedded systems**: ARM Cortex-M0 at 48 MHz, hardware multiply, 32KB RAM
+- **ML accelerators**: Custom formats (FP8, FP6, FP4), massive parallelism, specialized hardware
+- **High-end GPUs**: Thousands of cores, mixed precision, native FP8/FP16/FP32 support
 
-### Target Use Cases
+**Each platform needs different floating point:**
 
-- **Embedded systems**: 6502, 6809, Z80, AVR, ARM Cortex-M0
-- **Retro computing**: Commodore 64, Apple II, TRS-80, Atari 8-bit
-- **Machine learning**: FP8, bfloat16, custom precision formats
-- **Legacy code integration**: Systems with existing float libraries or ROM routines
+The 6502 game developer needs fast approximate math with minimal code size. Exact IEEE 754 compliance would consume most of available RAM and run too slowly for real-time graphics.
 
-### Core Problem
+The ML engineer needs to experiment with custom formats - maybe E4M3 works better than E5M2 for this layer, or perhaps E3M4 offers the right precision/range tradeoff. Formats change based on empirical results.
 
-No single floating point implementation meets all requirements. IEEE 754 binary32 requires ~8KB of code and assumes certain hardware capabilities. A Commodore 64 has 64KB total RAM. Google's TPU uses 8-bit floats. Apple II has floating point routines in ROM. Each case needs different tradeoffs.
+The edge device needs to compress model weights from training (FP32) to inference (FP8 with block-level scaling) while maintaining acceptable accuracy.
 
-### Motivating Example: FP8 on 6502
+The Apple II programmer has floating point routines already in ROM - why reimplement them when you can just call them?
 
-To illustrate the potential of policy-based design, consider FP8 E5M2 format (1 sign + 5 exponent + 2 mantissa bits) on a 6502:
+**Standard float libraries assume:**
+- IEEE 754 compliance (expensive without hardware support)
+- One format suffices for all use cases
+- Runtime flexibility through switches or function pointers
+- Hardware multiply and divide available
+- Special values (NaN, Infinity, denormals) always needed
 
-**IEEE 754 binary32 multiply:** ~700 cycles
-**FP8 E5M2 multiply with policies:** ~78 cycles
+**None of these assumptions hold universally.**
 
-The speedup comes from:
-- All operations in 8-bit registers (no multi-byte arithmetic)
-- 3×3 bit mantissa multiply via 64-byte lookup table (15 cycles)
-- 5-bit exponent addition (7 cycles)
-- No special value checks, no guard bits, no normalization
+The result: developers either accept bloated inefficient libraries, or write custom implementations for each platform, duplicating effort and introducing bugs.
 
-**Result:** A 1 MHz 6502 can perform ~12,800 FP8 multiplies per frame at 60fps. This enables:
-- 100-particle systems with full physics in ~5,000 cycles
-- Simple 3D wireframe engines (50-100 vertices) at 60fps
-- Game physics that would be impossible with float32
+### 2. The Solution: Configurable Definitions
 
-The precision (2 significant decimal digits, range ~0.0001 to ~57,000) is sufficient for particle positions, velocity calculations, and approximate physics on retro hardware.
+**Core insight:** The mathematical definitions of add, subtract, multiply, and divide are implementation-dependent and problem-dependent.
 
-This performance is only possible because the type system knows the exact bit widths and generates optimal code - not 8-bit or 32-bit generic routines, but exactly 3-bit × 3-bit multiplication.
+IEEE 754 defines one set of semantics (round to nearest, ties to even, handle NaN/Inf, gradual underflow). But:
+- Games might want "truncate and saturate" (faster, simpler)
+- ML inference might want "flush denormals to zero" (performance)
+- Scientific computing might want "error on any data loss" (correctness)
 
-## 2. The Problem
+**The solution is policy-based design:**
 
-### Code Size Constraints
+Separate WHAT (the format and behavior) from HOW (the implementation). Make all choices at compile time. Generate exactly the code needed, nothing more.
 
-A complete IEEE 754 binary32 software implementation requires:
-- Addition/subtraction: ~800 bytes
-- Multiplication: ~600 bytes
-- Division: ~1200 bytes
-- Special value handling: ~400 bytes
-- Total: ~3KB minimum
+**What you configure:**
+- **Format**: How many bits for sign, exponent, mantissa
+- **Arithmetic behavior**: Rounding mode, guard bits, normalization
+- **Special values**: NaN, Infinity, denormals - on or off independently
+- **Error handling**: Silent, exceptions, status flags, or compile-time errors
+- **Platform**: Which hardware features available
+- **Implementation**: Generic C++, hand-optimized assembly, ROM calls, hardware ops
 
-On a system with 64KB total memory where the application needs 60KB, this is unacceptable. Even removing features you don't need (denormals, all rounding modes, NaN) requires modifying the library source.
+**Key benefits:**
+- **Zero runtime overhead**: All decisions made at compile time
+- **Scales universally**: Same design works on 6502 and GPU
+- **Pluggable optimizations**: Drop in assembly or hardware implementations
+- **Sensible defaults**: Works correctly out of the box
+- **Progressive refinement**: Start with working code, optimize hot paths later
 
-### Performance Constraints
+**The same library supports:**
+- Commodore 64 with 78-cycle FP8 multiply (faster than integer!)
+- Apple II calling Wozniak's ROM routines (zero code size)
+- NVIDIA H100 with native MXFP8 hardware instructions
+- Custom ML format experimentation (E3M4, E4M3FNUZ, user inventions)
 
-Multiplication on 6502 (no hardware multiply):
-- 8×8→16 bit: ~80 cycles
-- 16×16→32 bit: ~250 cycles
-- 24-bit mantissa multiply: ~400 cycles
+### 3. Motivating Example: FP8 on 6502
 
-Division is worse. Every operation counts. Using lookup tables trades ROM/flash space for speed. Knowing the platform capabilities at compile time enables better algorithm selection.
+To make this concrete, consider a Commodore 64 game with a 100-particle system.
 
-### Format Flexibility
+**The challenge:** Each particle needs position updates (2 multiplies) and velocity updates (2 multiplies) = 400 multiplies per frame at 60 fps.
 
-IEEE 754 binary32 is not always correct:
-- FP8 E4M3: 1 sign + 4 exponent + 3 mantissa (ML inference)
-- FP8 E5M2: 1 sign + 5 exponent + 2 mantissa (ML training)
-- bfloat16: 1 sign + 8 exponent + 7 mantissa (ML, same range as binary32)
-- Microsoft binary format: Used in older BASIC interpreters
-- Wozniak's format: Apple II ROM routines
+**Option 1: IEEE 754 binary32**
+- Generic software implementation: ~700 cycles per multiply
+- Total: 280,000 cycles per frame
+- At 1 MHz (1,000,000 cycles/sec ÷ 60 frames/sec = 16,666 cycles/frame available)
+- Result: Can't achieve 60 fps, runs at ~6 fps
 
-### Integration with Existing Code
+**Option 2: 8×8 integer multiply**
+- Software shift-and-add: ~190 cycles per multiply
+- Total: 76,000 cycles per frame
+- Result: Achieves 21 fps, but choppy and no fractional values
 
-Some platforms have optimized implementations already:
-- Apple II: Wozniak's floating point routines in ROM
-- TI calculators: Built-in float operations
-- Custom ASICs: Hardware float units
-- Hand-optimized assembly: Platform-specific libraries
+**Option 3: FP8 E5M2 with this library**
+- 3-bit mantissa multiply via 64-byte lookup table: ~18 cycles
+- Total operation including unpack/pack: ~78 cycles per multiply
+- Total: 31,200 cycles per frame
+- Result: Smooth 60 fps with fractions and wide dynamic range
 
-Wrapping these in a consistent interface without losing their benefits requires flexible integration points.
+**Why FP8 wins:**
+- All operations fit in 8-bit registers (A, X, Y on 6502)
+- Mantissa multiply uses tiny lookup table instead of iteration
+- Range: 0.00006 to 57,344 (vs 0-255 for 8-bit integers)
+- Precision: ~2 significant digits (sufficient for particle positions/velocities)
 
-## 3. Design Goals
+**The configuration to achieve this:**
+User specifies format (1 sign + 5 exponent + 2 mantissa), selects "fast" policies (no special values, truncate rounding, no error checking), and library generates optimal code including the lookup table automatically.
 
-### Compile-Time Decisions
+**Key point:** The library makes FP8 faster than integer arithmetic while providing floating point semantics. This is only possible through compile-time optimization based on exact format knowledge.
 
-All format choices, special value handling, rounding modes, and error reporting strategies are resolved at compile time. The compiled code contains only the operations needed with the exact behavior specified. No runtime conditionals for "does this platform support denormals?"
+## Part II: What You Can Configure
 
-### Pay Only For What You Use
+### 4. Policy Dimensions Overview
 
-If you don't enable NaN support, zero code is generated for NaN handling. If you select truncate rounding, no guard bits are computed. If you disable error reporting, no error checking code exists. Dead code elimination happens through template instantiation and link-time optimization, not through manual #ifdef blocks.
+The library separates concerns into independent policy dimensions. Each dimension controls one aspect of behavior:
 
-### Platform-Specific Optimization
-
-Platform maintainers can provide optimized implementations without modifying the core library. A hand-written 6502 assembly multiply function integrates through the same interface as the C++ version. The library selects the right implementation based on configuration.
-
-### Arbitrary Format Support
-
-Any format with reasonable bit allocations works: sign (1 bit), exponent (2-11 bits typical), mantissa (2-52 bits typical). The library handles bit field extraction, type selection for intermediate values, and packing/unpacking automatically.
-
-## 4. Core Concept: Policy-Based Design
-
-### What Is a Policy?
-
-A policy is a compile-time decision about one aspect of the floating point type's behavior. Examples:
-
-- **Rounding policy**: How to round results (to nearest, toward zero, etc.)
-- **Error policy**: How to report errors (exceptions, flags, silent)
-- **Format policy**: How many bits for sign, exponent, mantissa
-
-### Why Separate Policies?
-
-Consider changing the rounding mode in a traditional library:
-1. Find all rounding code
-2. Modify conditional logic
-3. Test all combinations
-4. Hope you didn't break anything
-
-With policies:
-1. Change one template parameter
-2. Compiler generates new code automatically
-3. Old code still exists for other configurations
-
-### Policy Composition
-
-Policies combine to create a complete float type:
-
-```cpp
-// Each policy controls one aspect
-FormatPolicy<1, 8, 23>              // 32-bit format
-RoundingPolicy<ToNearest>           // IEEE 754 rounding
-ErrorPolicy<None>                   // No error checking
-SpecialValuePolicy<false, false>    // No NaN, no Inf
-
-// Combined into trait bundle
-struct FastFloat_Traits {
-    using format = FormatPolicy<1, 8, 23>;
-    using rounding = RoundingPolicy<ToNearest>;
-    using errors = ErrorPolicy<None>;
-    using specials = SpecialValuePolicy<false, false>;
-};
-
-// Creates complete float type
-FloatEngine<FastFloat_Traits>
-```
-
-### Independence and Interaction
-
-Most policies are independent:
-- Changing rounding mode doesn't affect error reporting
-- Changing format (16-bit vs 32-bit) doesn't affect special value handling
-- Changing storage layout doesn't affect arithmetic behavior
-
-Some policies interact:
-- Rounding mode "to nearest" requires guard bits
-- Denormal support requires normalization handling
-- NaN support requires all-ones exponent interpretation
-
-The library validates policy combinations at compile time.
-
-## 5. Configurable Aspects (Overview)
-
-### Number Format
-
-How many bits for each field:
-- Sign: typically 1 bit
-- Exponent: 2-11 bits (determines range)
-- Mantissa: 2-52 bits (determines precision)
-- Implicit leading bit: yes/no
+**Format Specification:**
+- Bit allocation: sign, exponent, mantissa bits
 - Exponent bias: standard or custom
+- Implicit bit: hidden leading 1 or explicit
+- Total size: 8, 16, 24, 32, 64 bits or custom
 
-### Special Values
+**Special Value Vocabulary:**
+- NaN support: yes/no
+- Infinity support: yes/no
+- Signed zeros: yes/no  
+- Denormal numbers: yes/no
 
-Which exceptional values exist:
-- NaN (Not a Number)
-- Infinity (positive and negative)
-- Signed zeros (+0, -0)
-- Denormals (subnormal numbers)
-
-Each can be enabled or disabled independently.
-
-### Arithmetic Behavior
-
-How operations are performed:
+**Arithmetic Behavior:**
 - Rounding mode: to nearest, toward zero, toward ±infinity
-- Guard bits: extra precision bits (0, 3, 8, 16, ...)
+- Guard bits: 0, 3 (G+R+S), 8 (byte), 16+ (extended precision)
 - Normalization: always, lazy, never
 - Intermediate precision: can exceed storage precision
 
-### Error Handling
+**Special Value Handling:**
+- NaN propagation: preserve, convert to max, error
+- Infinity arithmetic: IEEE rules, convert to max, error
+- Denormal handling: full support, flush to zero, flush inputs, flush outputs
+- Overflow behavior: saturate, infinity, undefined
+- Underflow behavior: gradual, flush, undefined
 
-How errors are detected and reported:
+**Error Management:**
 - Detection: which conditions trigger errors
 - Reporting: none, errno, exceptions, status flags, callbacks
 - Propagation: how errors flow through calculations
 
-### Memory Layout
-
-Physical bit arrangement:
-- Field order: sign-exp-mant, mant-exp-sign, or others
-- Packing: tight bitfields vs byte-aligned
-- Endianness: little, big, or native
+**Storage Format:**
+- Field ordering: sign-exp-mant, mant-exp-sign, custom
+- Packing: tight bitfields, byte-aligned, native
+- Endianness: little, big, native
 - Padding: allowed or forbidden
 
-### Hardware Capabilities
-
-Platform features that affect implementation:
+**Hardware Capabilities:**
 - Integer multiply: hardware or software
 - Integer divide: hardware or software
-- Barrel shifter: single-cycle multi-bit shifts
-- CLZ/CTZ: count leading/trailing zeros
-- SIMD: vector operations
+- Barrel shifter: single-cycle or iterative
+- CLZ/CTZ: count leading/trailing zeros instruction
+- SIMD: vector operations available
 
-### Implementation Source
+**Integer Arithmetic Strategy:**
+- Multiply: hardware, lookup table, shift-and-add, Booth's algorithm
+- Divide: hardware, reciprocal table, shift-and-subtract, Newton-Raphson
+- Table size limits for lookup-based approaches
 
-Where operation code comes from:
-- Pure C++: template-generated code
-- Inline assembly: embedded in C++
-- External assembly: linked object files
+**Code Generation Hints:**
+- Preferred integer width: 8, 16, 24, 32, 64 bits
+- Type selection: BitInt for exact sizes or uint_least_N
+- Loop unrolling: suggest to compiler or not
+- Lookup tables: prefer or avoid
+- Inline depth: how aggressively to inline
+
+**Operation Set:**
+- Basic: add, subtract, multiply, divide
+- Extended: sqrt, fused multiply-add, remainder
+- Transcendentals: sin, cos, log, exp (future)
+- Conversions: between formats, to/from integers/strings
+- Comparisons: ordered, unordered, NaN handling
+
+**Implementation Source:**
+- Pure C++: template-generated generic code
+- Inline assembly: embedded in C++ functions
+- External assembly: separate .s files
 - ROM routines: platform firmware calls
-- Hardware: builtin operations
+- Hardware: native instructions
+- External library: link to existing implementations
 
-## 6. Example Configurations
+**Testing Strategy:**
+- Exhaustive: test all input combinations
+- Edge-plus-sampling: boundaries plus random
+- Property-based: algebraic laws only
+- Targeted: hand-picked difficult cases
+- Sample count: how many random cases
 
-### IEEE 754 Binary32
+**These dimensions are mostly independent.** Changing rounding mode doesn't affect error reporting. Changing format size doesn't affect special value handling. This orthogonality enables flexible configuration.
 
-Standard 32-bit float with full IEEE 754 compliance:
+**Some interactions exist:** Rounding modes other than "toward zero" require guard bits. Denormal support requires normalization handling. The library validates policy combinations at compile time and produces clear error messages for invalid combinations.
 
-```cpp
-struct IEEE754_Binary32_Traits {
-    using format = FormatPolicy<1, 8, 23>;
-    using specials = SpecialValuePolicy<
-        true,   // NaN
-        true,   // Infinity
-        true,   // Signed zeros
-        true    // Denormals
-    >;
-    using rounding = RoundingPolicy<ToNearest>;
-    using guard_bits = GuardBitsPolicy<3>;  // G, R, S bits
-    using errors = ErrorPolicy<LocalFlags>;
-    using normalization = NormalizationPolicy<Always>;
-    using implementation = ImplementationPolicy<DefaultOps>;
-};
-```
+### 5. Example Configurations
 
-**Use case**: Maximum compatibility with standard libraries and interchange formats.
+Real-world configurations demonstrate how policies compose:
 
-**Tradeoffs**: Largest code size (~3KB), handles all edge cases, slowest on platforms without hardware support.
+**IEEE 754 Binary32 (Standard Float):**
+- Format: 1 sign + 8 exponent + 23 mantissa bits
+- Specials: All (NaN, Inf, signed zeros, denormals)
+- Rounding: To nearest, ties to even
+- Guard bits: 3 (G+R+S)
+- Errors: Track all conditions, report via local flags
+- Use case: Maximum compatibility and correctness
 
-### Minimal 6502 Float
+**Minimal 6502 (Fast Game Math):**
+- Format: 1 + 8 + 23 (same storage as binary32)
+- Specials: None
+- Rounding: Toward zero (truncate)
+- Guard bits: 0
+- Errors: None
+- Result: ~800 bytes code, very fast, approximate
 
-Smallest possible code size for Commodore 64:
+**Accurate 6502 (Quality Game Math):**
+- Format: 1 + 8 + 23
+- Specials: Infinity only (for overflow detection)
+- Rounding: To nearest
+- Guard bits: 8 (full byte, easier on 6502)
+- Errors: None
+- Result: ~1.5KB code, correct rounding, reliable
 
-```cpp
-struct C64_Minimal_Traits {
-    using format = FormatPolicy<1, 8, 23>;
-    using specials = SpecialValuePolicy<
-        false,  // No NaN
-        false,  // No Infinity
-        false,  // Single zero
-        false   // No denormals
-    >;
-    using rounding = RoundingPolicy<TowardZero>;  // Truncate
-    using guard_bits = GuardBitsPolicy<0>;
-    using errors = ErrorPolicy<None>;
-    using normalization = NormalizationPolicy<Lazy>;
-    using implementation = ImplementationPolicy<DefaultOps>;
-};
-```
+**FP8 E5M2 (ML Wide Range):**
+- Format: 1 + 5 + 2
+- Specials: NaN, Infinity (no denormals)
+- Rounding: To nearest
+- Guard bits: 3
+- Use case: ML activations needing large dynamic range
 
-**Use case**: Games, demos, applications where code size is critical and perfect accuracy isn't required.
+**FP8 E4M3 (ML Better Precision):**
+- Format: 1 + 4 + 3
+- Specials: NaN only (no Infinity, E4M3 convention)
+- Rounding: To nearest
+- Guard bits: 3
+- Use case: ML weights needing better precision
 
-**Tradeoffs**: ~800 bytes total code, no special cases, truncation errors accumulate, overflow/underflow produce garbage.
+**Apple II ROM Routines:**
+- Format: 1 + 8 + 23 (Wozniak's format)
+- Implementation: Calls to $E7BE (add), $E97F (multiply), etc.
+- Result: Near-zero code size, fast, matches BASIC behavior
 
-### Accurate 6502 Float
+**NVIDIA H100 MXFP8:**
+- Element format: 1 + 4 + 3 (E4M3)
+- Block size: 32 elements
+- Scale: E8M0 (power of 2)
+- Implementation: Native hardware instructions
+- Use case: Production ML inference
 
-Better accuracy while keeping reasonable code size:
+Each configuration represents different points in the precision/performance/code-size tradeoff space. The library provides sensible presets while allowing full customization.
 
-```cpp
-struct C64_Accurate_Traits {
-    using format = FormatPolicy<1, 8, 23>;
-    using specials = SpecialValuePolicy<
-        false,  // No NaN
-        true,   // Infinity (for overflow)
-        false,  // Single zero
-        false   // No denormals
-    >;
-    using rounding = RoundingPolicy<ToNearest>;
-    using guard_bits = GuardBitsPolicy<8>;  // Full byte
-    using errors = ErrorPolicy<None>;
-    using normalization = NormalizationPolicy<Always>;
-    using implementation = ImplementationPolicy<DefaultOps>;
-};
-```
+## Part III: Using The Library
 
-**Use case**: Scientific calculations, financial software, applications needing reliable results.
+### 6. Basic Operations
 
-**Tradeoffs**: ~1.5KB code size, proper rounding, handles overflow gracefully, about 20% slower than minimal version.
+**Creating float types:**
 
-### Apple II with Wozniak ROM
-
-Use the floating point routines built into Apple II ROM:
+Users select a configuration (preset or custom) and the library generates the corresponding type. The interface is minimal:
 
 ```cpp
-struct AppleII_ROM_Traits {
-    using format = FormatPolicy<1, 8, 23>;  // Wozniak's format
-    using specials = SpecialValuePolicy<false, false, false, false>;
-    using rounding = RoundingPolicy<ToNearest>;  // ROM does this
-    using guard_bits = GuardBitsPolicy<8>;       // ROM uses guard byte
-    using errors = ErrorPolicy<None>;
-    using normalization = NormalizationPolicy<Always>;
-    using implementation = ImplementationPolicy<AppleII_WozOps>;
-};
-
-// Implementation calls ROM
-template<typename Traits>
-struct AppleII_WozOps {
-    static uint32_t add(uint32_t a, uint32_t b) {
-        // Set up FAC and ARG, JSR $E7BE (FADD)
-    }
-    static uint32_t mul(uint32_t a, uint32_t b) {
-        // JSR $E97F (FMUL)
-    }
-    // ... etc
-};
+FloatEngine<ConfigName>
 ```
 
-**Use case**: Apple II software that wants consistent float behavior with BASIC.
+Where ConfigName specifies all policies. For common cases, preset configurations are available.
 
-**Tradeoffs**: Near-zero code size (just calling wrappers), fast (ROM is optimized), limited to Wozniak's format and behavior.
+**Arithmetic operations:**
 
-### FP8 E4M3 for Machine Learning
-
-8-bit float for neural network inference:
+Standard operators work as expected. The actual implementation depends on the policies configured:
 
 ```cpp
-struct FP8_E4M3_Traits {
-    using format = FormatPolicy<1, 4, 3>;
-    using specials = SpecialValuePolicy<
-        true,   // NaN (E4M3 convention)
-        false,  // No Infinity (E4M3 convention)
-        true,   // Signed zeros
-        false   // No denormals (E4M3 convention)
-    >;
-    using rounding = RoundingPolicy<ToNearest>;
-    using guard_bits = GuardBitsPolicy<3>;
-    using errors = ErrorPolicy<None>;
-    using normalization = NormalizationPolicy<Always>;
-    using exponent_bias = ExponentBiasPolicy<7>;  // Non-standard
-    using implementation = ImplementationPolicy<DefaultOps>;
-};
+a + b    // Addition
+a - b    // Subtraction  
+a * b    // Multiplication
+a / b    // Division
 ```
 
-**Use case**: ML model inference on edge devices, training with reduced precision.
+Behind the scenes, the library dispatches to the appropriate implementation (generic C++, platform assembly, hardware instruction) based on configuration.
 
-**Tradeoffs**: Tiny memory footprint (1 byte per value), limited range and precision, fast operations due to small size.
+**Special operations:**
 
-## 7. Policy Dimensions (Detailed)
-
-### 7.1 Number System Structure
-
-Defines the mathematical structure of the number representation.
-
-**Components:**
-
-- **Bit allocation**: Number of bits for sign, exponent, mantissa
-- **Exponent bias**: How zero exponent is encoded (typically 2^(E-1) - 1)
-- **Implicit bit**: Whether mantissa has hidden leading 1
-- **Sign representation**: Sign bit, two's complement, or sign-magnitude
-
-**Why these cluster together**: These four aspects define the encoding. You cannot interpret the bits without knowing all four. They are inseparable.
-
-**Available choices:**
-
-Sign bits: Always 1 (no known formats use more)
-Exponent bits: 2-11 typical (determines range: ~10^±1 to ~10^±308)
-Mantissa bits: 2-52 typical (determines precision: ~3-16 decimal digits)
-
-Implicit bit: Usually true for normalized formats (saves 1 bit of storage)
-Exponent bias: Usually 2^(E-1)-1, but ML formats may differ
-
-**Examples:**
+Additional operations available based on configuration:
 
 ```cpp
-// IEEE 754 binary32: 1 + 8 + 23 bits
-FormatPolicy<1, 8, 23>  
-// Bias = 127, implicit bit = true
-
-// FP8 E5M2: 1 + 5 + 2 bits  
-FormatPolicy<1, 5, 2>   
-// Bias = 15, implicit bit = true
-
-// FP8 E4M3: 1 + 4 + 3 bits
-FormatPolicy<1, 4, 3>
-// Bias = 7 (non-standard!), implicit bit = true
+sqrt(a)      // If operation set includes sqrt
+fma(a, b, c) // Fused multiply-add: (a * b) + c
+abs(a)       // Absolute value
+sign(a)      // Sign extraction
 ```
 
-**Interactions**: Format determines storage type selection. An 8-bit format uses `uint8_t`, 32-bit uses `uint32_t`. Intermediate calculations may need larger types (32-bit format multiplication may need 64-bit intermediate).
+Operations not included in the configured operation set produce compile-time errors.
 
-### 7.2 Special Value Vocabulary
-
-Defines which exceptional values can be represented.
-
-**Why separate from Number System Structure**: Special values are optional features. Same bit layout can support or not support NaN. The encoding reserves certain bit patterns (exponent=0, exponent=max) but the semantics are policy choices.
-
-**Available choices:**
-
-- **NaN (Not a Number)**: Result of 0/0, sqrt(-1), inf-inf
-- **Infinity**: Result of overflow or 1/0
-- **Signed zeros**: Distinguish +0 from -0
-- **Denormals**: Numbers smaller than the smallest normalized value
-
-Each can be enabled independently, though some combinations are unusual (NaN without Infinity is rare).
-
-**Encoding implications:**
-
-When enabled:
-- NaN: exponent = all 1s, mantissa ≠ 0
-- Infinity: exponent = all 1s, mantissa = 0
-- Denormals: exponent = 0, mantissa ≠ 0
-- Zero: exponent = 0, mantissa = 0
-
-When disabled, these bit patterns may represent normal numbers or be undefined.
-
-**Examples:**
+**Comparison and testing:**
 
 ```cpp
-// Full IEEE 754 special values
-SpecialValuePolicy<true, true, true, true>
-
-// Minimal (no special values at all)
-SpecialValuePolicy<false, false, false, false>
-
-// Infinity only (overflow detection without NaN complexity)
-SpecialValuePolicy<false, true, false, false>
-
-// FP8 E4M3 convention (NaN but no Infinity)
-SpecialValuePolicy<true, false, true, false>
+a < b, a <= b, a > b, a >= b, a == b, a != b
+is_nan(a), is_inf(a), is_finite(a)
 ```
 
-**Interactions**: 
-- NaN support adds code for every operation to check and propagate NaN
-- Denormal support requires special handling in normalization
-- Without special values, exponent=0 and exponent=max are normal numbers
+Comparison semantics depend on special value policies. If NaN is disabled, is_nan() always returns false at compile time.
 
-### 7.3 Arithmetic Behavior
+### 7. Format Conversion
 
-Defines how operations compute results.
+**The conversion problem:**
 
-**Components:**
+ML training uses FP32, inference uses FP8. Legacy code uses Microsoft BASIC format, modern code uses IEEE 754. Researchers experiment with E4M3 vs E5M2 vs E3M4. Format conversion is essential.
 
-- **Rounding mode**: How to handle results that don't fit exactly
-- **Guard bits**: Extra precision during computation
-- **Normalization strategy**: When to normalize mantissa
-- **Intermediate precision**: Can exceed storage precision
+**Conversion challenges:**
+- Range differences: source max value exceeds destination max
+- Precision differences: 23-bit mantissa → 3-bit mantissa requires rounding
+- Special value mapping: source has Inf, destination doesn't
+- Signed zero handling: FNUZ formats have only one zero
 
-**Why these cluster together**: These affect numeric quality and performance of operations. They are independent of the format itself.
+**User interface:**
 
-**Rounding modes:**
-
-- **ToNearest (ties to even)**: Round to closest representable value, ties choose even mantissa. IEEE 754 default. Most accurate.
-- **TowardZero (truncate)**: Round toward zero (ceiling for negative, floor for positive). Simplest, fastest.
-- **TowardPositive (ceiling)**: Always round up.
-- **TowardNegative (floor)**: Always round down.
-- **ToNearest (ties away from zero)**: Alternative tie-breaking rule, not IEEE 754 standard.
-
-**Guard bits:**
-
-Number of extra precision bits maintained during computation:
-- 0: No guard bits. Truncate results. Fast but inaccurate.
-- 3: Guard, Round, Sticky bits. IEEE 754 minimum. Correct rounding.
-- 8: Full guard byte. Easier arithmetic on 8-bit platforms.
-- 16+: Extra precision for iterative algorithms.
-
-**Normalization:**
-
-- **Always**: Maintain normalized form (leading 1) throughout computation
-- **Lazy**: Normalize only when packing result
-- **Never**: Allow denormalized intermediate values
-
-**Examples:**
+Conversions should be implicit when safe, explicit when needed:
 
 ```cpp
-// IEEE 754 compliant
-RoundingPolicy<ToNearest>
-GuardBitsPolicy<3>
-NormalizationPolicy<Always>
-
-// Fast 6502
-RoundingPolicy<TowardZero>
-GuardBitsPolicy<0>
-NormalizationPolicy<Lazy>
-
-// High precision
-RoundingPolicy<ToNearest>
-GuardBitsPolicy<16>
-NormalizationPolicy<Always>
+FP8 dest = fp32_source;           // Implicit conversion
+dest = convert<FP8>(fp32_source); // Explicit conversion
 ```
 
-**Interactions**:
-- Rounding modes except TowardZero require guard bits
-- Guard bits increase intermediate storage requirements
-- Lazy normalization reduces operations but complicates packing
+The library handles all format details automatically.
 
-### 7.4 Special Value Handling
+**Conversion policies:**
 
-Defines what happens when special values are encountered.
+Behavior during conversion is configurable:
 
-**Why separate from Special Value Vocabulary**: A format can have NaN encoding but flush all NaNs to zero. The vocabulary says "NaN exists as a bit pattern," the handling says "what do we do when we see one?"
+- **Range handling**: What to do on overflow (saturate, error, infinity) and underflow (flush to zero, denormal, error)
+- **Precision handling**: Which rounding mode to use when narrowing mantissa
+- **Special value mapping**: How to map NaN, Inf, denormals when destination doesn't support them
+- **Error reporting**: Silent, exceptions, status flags, or compile-time errors
 
-**Components:**
+**Preset conversion policies:**
 
-- **NaN propagation**: Return NaN, throw error, or flush to zero
-- **Infinity arithmetic**: Follow IEEE rules or treat as error
-- **Denormal handling**: Full support, flush to zero (FTZ), flush inputs (FIZ), flush outputs (FOZ)
-- **Overflow behavior**: Return infinity, saturate to max, or undefined
-- **Underflow behavior**: Gradual (denormals), flush to zero, or undefined
+Most users don't configure conversion details. Presets cover common cases:
 
-**Denormal handling modes:**
+- **SafeConversion** (default): Saturate on overflow, flush on underflow, preserve special values when possible, round to nearest
+- **FastConversion**: Saturate on overflow, truncate mantissa, skip special value checks
+- **StrictConversion**: Error on any potential data loss (overflow, underflow, precision loss)
+- **MLInferenceConversion**: Optimized for quantizing training weights to inference formats
 
-- **Full support**: Gradual underflow per IEEE 754. Expensive.
-- **FTZ (Flush To Zero)**: Treat denormal inputs as zero, flush denormal outputs to zero. Common optimization.
-- **FIZ (Flush Inputs to Zero)**: Treat denormal inputs as zero, but can produce denormal outputs.
-- **FOZ (Flush Outputs to Zero)**: Accept denormal inputs, but flush denormal outputs to zero.
-- **No support**: Denormal inputs/outputs produce undefined behavior.
+**Conversion implementation:**
 
-**Examples:**
+The conversion algorithm:
+1. Unpack source format
+2. Handle special values (NaN, Inf, zero)
+3. Adjust exponent bias
+4. Check for range overflow/underflow
+5. Convert mantissa (widen by shifting, narrow by rounding)
+6. Handle mantissa overflow from rounding
+7. Pack destination format
+
+Each step uses policy configuration to determine behavior. Platform-specific conversions can be provided (e.g., FP8 ↔ FP8 via lookup tables).
+
+### 8. Microscaling (MX) Formats
+
+**What MX formats are:**
+
+Microscaling addresses a limitation of simple per-tensor quantization. With one scale factor per tensor, all values must fit in the format's range. This forces use of low-precision but wide-range formats (E5M2) even when higher-precision formats (E4M3) would be better.
+
+MX assigns a different scale factor to each block of values (typically 32). This dramatically improves dynamic range, allowing use of higher-precision formats.
+
+**Structure:**
+- Block of k values (typically 32)
+- Each value: element format (FP8 E4M3, FP6, FP4, or INT8)
+- Shared scale: E8M0 format (pure power of 2)
+
+Effective value: vᵢ = scale × elementᵢ
+
+**Why it matters:**
+
+NVIDIA H100 GPUs have native MXFP8 hardware support. Production ML systems use MX formats for inference. The technique is proven and deployed.
+
+**Standard MX formats:**
+- MXFP8 (E4M3 or E5M2 elements)
+- MXFP6 (E3M2 or E2M3 elements)
+- MXFP4 (E2M1 elements)
+- MXINT8 (8-bit integers)
+
+All use 32-element blocks with E8M0 scales.
+
+**User interface:**
+
+MX formats are containers, not numeric types:
 
 ```cpp
-// IEEE 754 compliant
-struct IEEE_SpecialHandling {
-    static constexpr bool propagate_nan = true;
-    static constexpr bool infinity_arithmetic = true;
-    static constexpr DenormalMode denormals = DenormalMode::FullSupport;
-    static constexpr OverflowMode overflow = OverflowMode::ToInfinity;
-};
-
-// Fast path (no special handling)
-struct Fast_SpecialHandling {
-    static constexpr bool propagate_nan = false;
-    static constexpr bool infinity_arithmetic = false;
-    static constexpr DenormalMode denormals = DenormalMode::FlushToZero;
-    static constexpr OverflowMode overflow = OverflowMode::Undefined;
-};
+MicroscaledArray<MXFP8_E4M3> data = quantize(float_array);
+float value = data.get(index);  // Decompresses on access
 ```
 
-**Interactions**:
-- Denormal handling mode only matters if denormals are in vocabulary
-- NaN propagation only relevant if NaN is in vocabulary
-- Flush-to-zero modes save significant code size and cycles
+Arithmetic happens after decompression to float or half-float, then results can be re-quantized.
 
-### 7.5 Error Management
+**Quantization process:**
+1. Divide array into blocks of 32
+2. For each block, find optimal scale (max absolute value, RMS, or percentile)
+3. Convert each element using that scale
+4. Store scale (8 bits) and elements (8, 6, or 4 bits each)
 
-Defines how errors are detected and reported.
+**Integration with library:**
 
-**Components:**
+MX formats leverage existing infrastructure:
+- Element types (E4M3, E5M2) are regular FloatEngine types
+- Scale type (E8M0) is a regular FloatEngine type  
+- Quantization uses existing conversion system
+- Only new code: scale finding and block management
 
-- **Error detection**: Which conditions are tracked
-- **Error reporting mechanism**: How errors reach the user
-- **Error propagation**: How errors flow through calculations
+This demonstrates the design's flexibility - production formats integrate cleanly without special cases.
 
-**Error conditions:**
+## Part IV: Architecture
 
-- **Invalid operation**: 0/0, sqrt(-1), inf-inf
-- **Division by zero**: x/0 where x ≠ 0
-- **Overflow**: Result magnitude too large to represent
-- **Underflow**: Result magnitude too small to represent (or flushes to zero)
-- **Inexact**: Result was rounded (not exactly representable)
+### 9. How Policies Work
 
-**Reporting mechanisms:**
+**Policy groups:**
 
-- **None**: No error checking. Smallest code size. Errors produce garbage.
-- **errno**: Set global `errno` variable. C standard approach. Not thread-safe.
-- **Exceptions**: Throw C++ exceptions. Allows stack unwinding. Large code size.
-- **Local flags**: Return status alongside result. Thread-safe. Caller must check.
-- **Global flags**: Status register (like FPU status). Not thread-safe but fast.
-- **Callbacks**: Call registered error handler. Flexible but complex.
+Ten individual policies would be overwhelming. Related policies group into bundles:
 
-**Examples:**
+- **Format group**: Bit allocation, bias, implicit bit, sign representation
+- **Compliance group**: Special values, handling modes, errors
+- **Arithmetic group**: Rounding, guard bits, normalization
+- **Platform group**: Hardware capabilities, code generation hints
+
+Complete configurations combine groups:
 
 ```cpp
-// No error checking (smallest code)
-ErrorPolicy<ErrorHandling::None>
-
-// IEEE 754 style (track all errors in flags)
-struct IEEE_ErrorPolicy {
-    static constexpr bool track_invalid = true;
-    static constexpr bool track_div_by_zero = true;
-    static constexpr bool track_overflow = true;
-    static constexpr bool track_underflow = true;
-    static constexpr bool track_inexact = true;
-    using mechanism = LocalFlags;
-};
-
-// Exceptions for critical errors only
-struct SafetyErrorPolicy {
-    static constexpr bool track_invalid = true;
-    static constexpr bool track_div_by_zero = true;
-    static constexpr bool track_overflow = false;
-    static constexpr bool track_underflow = false;
-    static constexpr bool track_inexact = false;
-    using mechanism = Exceptions;
-};
+StandardTraits<FormatGroup, ComplianceGroup, ArithmeticGroup, PlatformGroup>
 ```
 
-**Interactions**:
-- Error detection adds checks to every operation
-- Exception mechanism requires C++ exception support
-- Local flags require modified function signatures (return struct with status)
+**Trait bundles:**
 
-### 7.6 Storage Format
-
-Defines the physical bit layout in memory.
-
-**Components:**
-
-- **Field order**: Which field occupies which bits
-- **Packing**: Tight bitfields or byte-aligned
-- **Endianness**: Little, big, or native byte order
-- **Padding**: Allowed between fields or not
-
-**Why this matters**: Binary interchange requires matching layouts. Performance may benefit from particular orderings. Some platforms prefer byte-aligned access.
-
-**Field order examples:**
-
-```
-IEEE 754 standard bit numbering (MSB to LSB):
-[sign][exponent][mantissa]
-Bit 31: sign, Bits 30-23: exponent, Bits 22-0: mantissa
-
-Reversed for some platforms:
-[mantissa][exponent][sign]
-Easier to mask off mantissa as low bits
-
-Split sign:
-[exponent][mantissa][sign]
-Uncommon but simplifies some operations
-```
-
-**Packing strategies:**
-
-- **Tight**: Use bitfields to pack exactly. No wasted bits.
-- **Byte-aligned**: Each field starts on byte boundary. Wastes bits but faster access.
-- **Platform native**: Let compiler decide. May add padding.
-
-**Examples:**
+Users typically use named bundles rather than specifying all policies:
 
 ```cpp
-// IEEE 754 standard layout
-struct StorageLayout_IEEE {
-    enum class FieldOrder { SignExpMant };  // MSB to LSB
-    enum class Packing { Tight };
-    enum class Endian { Little };
-};
-
-// Byte-aligned for faster access
-struct StorageLayout_Fast {
-    enum class FieldOrder { SignExpMant };
-    enum class Packing { ByteAligned };
-    enum class Endian { Native };
-};
+IEEE754_Binary32    // Full compliance, all features
+C64_Fast           // Minimal features, maximum speed
+C64_Accurate       // Correct rounding, reasonable size
 ```
 
-**Interactions**:
-- Endianness matters for binary file I/O
-- Packing affects structure size (may not match format bit count)
-- Field order is cosmetic unless doing binary I/O
-
-### 7.7 Hardware Capabilities
-
-Describes what the target platform provides in hardware.
-
-**Components:**
-
-- **Integer multiply**: Hardware or software
-- **Integer divide**: Hardware or software
-- **Barrel shifter**: Single-cycle multi-bit shifts
-- **CLZ/CTZ**: Count leading/trailing zeros
-- **SIMD**: Vector operations
-
-**Why this matters**: Algorithm selection depends on available hardware. Software multiply on 6502 takes 200+ cycles. Hardware multiply on ARM takes 1 cycle. Different algorithms are optimal.
-
-**Platform examples:**
-
-```cpp
-// 6502: minimal hardware support
-struct MOS6502_Hardware {
-    static constexpr bool has_multiply = false;
-    static constexpr bool has_divide = false;
-    static constexpr bool has_barrel_shift = false;
-    static constexpr bool has_clz = false;
-    static constexpr bool has_simd = false;
-};
-
-// ARM Cortex-M4: moderate support
-struct ARM_M4_Hardware {
-    static constexpr bool has_multiply = true;   // 1 cycle
-    static constexpr bool has_divide = true;     // 2-12 cycles
-    static constexpr bool has_barrel_shift = true;
-    static constexpr bool has_clz = true;
-    static constexpr bool has_simd = false;
-};
-
-// x86-64: full support
-struct x86_64_Hardware {
-    static constexpr bool has_multiply = true;
-    static constexpr bool has_divide = true;
-    static constexpr bool has_barrel_shift = true;
-    static constexpr bool has_clz = true;
-    static constexpr bool has_simd = true;  // SSE/AVX
-};
-```
-
-**Algorithm implications:**
-
-Without hardware multiply:
-- Use shift-and-add algorithms
-- Lookup tables for partial products
-- Avoid multiplication where possible
-
-With hardware multiply:
-- Direct multiply instructions
-- More straightforward algorithms
-
-Without CLZ:
-- Linear search for leading 1
-- Or lookup table
-
-With CLZ:
-- Direct normalization in O(1)
-
-**Interactions**:
-- Hardware capabilities affect code generation hints
-- May influence guard bit choice (byte vs bit)
-- Determines feasibility of certain algorithms
-
-### 7.8 Code Generation Hints
-
-Guides the compiler toward better code generation.
-
-**Components:**
-
-- **Preferred integer width**: 8, 16, 24, 32, or 64 bit operations
-- **Type selection strategy**: Use `_BitInt(N)` for exact sizes, or `uint_least_N`
-- **Loop unroll hints**: Whether to suggest unrolling
-- **Lookup table preference**: Trade ROM/flash for speed
-- **Inline depth**: How aggressively to inline
-
-**Why these are hints, not requirements**: The compiler makes final decisions. These are suggestions based on platform characteristics.
+Bundles can be customized by inheriting and overriding specific policies.
 
 **Type selection:**
 
+A critical optimization: the library selects the smallest integer type that can hold each field.
+
+On 6502 with 16-bit integers:
+- 1-8 bit fields → uint8_t (8-bit operations, fast)
+- 9-16 bit fields → uint16_t (16-bit operations, slower)
+- 17-24 bit fields → uint24_t via BitInt (custom, slower still)
+- 25-32 bit fields → uint32_t (32-bit operations, very slow)
+
+For FP8 E5M2:
+- Storage: uint8_t (8 bits total)
+- Exponent operations: uint8_t (5 bits fits)
+- Mantissa operations: uint8_t (2+3 guard = 5 bits fits)
+
+All arithmetic stays in fast 8-bit operations. The compiler generates optimal code because it knows exact sizes.
+
+Here's how the library achieves this:
+
 ```cpp
-// Prefer exact-width BitInt types
-struct TypePolicy_Exact {
-    template<int Bits>
-    using uint_type = unsigned _BitInt(Bits);
-    
-    // Use exactly: uint _BitInt(24) for 24-bit values
+// Select smallest integer type that fits N bits
+template<int N>
+struct SelectIntType {
+    using type = 
+        std::conditional_t<(N <= 8), uint_least8_t,
+        std::conditional_t<(N <= 16), uint_least16_t,
+        std::conditional_t<(N <= 24), unsigned _BitInt(24),
+        std::conditional_t<(N <= 32), uint_least32_t,
+        uint_least64_t>>>>;
 };
 
-// Prefer standard types (more portable)
-struct TypePolicy_Standard {
-    template<int Bits>
-    using uint_type = 
-        std::conditional_t<Bits <= 8, uint_least8_t,
-        std::conditional_t<Bits <= 16, uint_least16_t,
-        std::conditional_t<Bits <= 32, uint_least32_t,
-        uint_least64_t>>>;
+// Format policy uses this to choose storage types
+template<int S, int E, int M>
+struct FormatPolicy {
+    static constexpr int sign_bits = S;
+    static constexpr int exponent_bits = E;
+    static constexpr int mantissa_bits = M;
+    static constexpr int total_bits = S + E + M;
     
-    // Use: uint_least8_t, uint_least16_t, uint_least32_t
+    // Storage type: exactly sized for total bits
+    using storage_type = typename SelectIntType<total_bits>::type;
+    
+    // Field types: sized for individual fields
+    using mantissa_type = typename SelectIntType<M>::type;
+    using exponent_type = typename SelectIntType<E>::type;
+    
+    // Computation types: sized for intermediate values with guard bits
+    using mantissa_compute_type = 
+        typename SelectIntType<M + guard_bits>::type;
+    using exponent_compute_type = 
+        typename SelectIntType<E + 2>::type;  // Extra for over/underflow
 };
 ```
 
-**Platform-specific hints:**
+The key insight: the compiler can optimize operations on uint8_t much better than operations on a generic "small int" type. By knowing exact sizes at compile time, we enable the best code generation.
+
+**Template architecture:**
+
+The library uses layered templates:
+
+1. **Public interface**: User-visible operations (add, multiply, etc.)
+2. **Policy extraction**: Unpacks trait bundles into individual policies
+3. **Implementation selection**: Chooses generic C++, assembly, or hardware based on configuration
+4. **Operation implementation**: Actual arithmetic using policies
+
+This separation enables compile-time optimization while maintaining clean user interface.
+
+**Compile-time validation:**
+
+Invalid policy combinations fail at compile time with clear messages:
+- "Rounding mode ToNearest requires guard bits > 0"
+- "Denormal support requires normalization"
+- "Platform MOS6502 does not support hardware multiply"
+
+Users discover configuration errors during development, not at runtime.
+
+### 10. Pluggable Implementations
+
+**The implementation policy:**
+
+Like other aspects, where operation code comes from is configurable:
+
+- **Generic**: Template-generated C++ works everywhere
+- **Platform-specific**: Hand-optimized assembly for performance-critical operations
+- **ROM calls**: Leverage existing firmware implementations
+- **Hardware**: Native instructions when available
+
+**How it works:**
+
+Each operation dispatches through an implementation policy. The library structure looks like this:
 
 ```cpp
-// 6502: prefer byte operations, avoid unrolling
-struct CodeGenHints_6502 {
-    static constexpr int preferred_int_width = 8;
-    static constexpr bool use_bitint = false;
-    static constexpr bool hint_unroll = false;
-    static constexpr bool use_lookup_tables = true;  // ROM is cheap
-    static constexpr int inline_depth = 2;
-};
-
-// x86-64: prefer wide operations, aggressive unrolling
-struct CodeGenHints_x86_64 {
-    static constexpr int preferred_int_width = 64;
-    static constexpr bool use_bitint = true;
-    static constexpr bool hint_unroll = true;
-    static constexpr bool use_lookup_tables = false;  // Cache misses
-    static constexpr int inline_depth = 8;
-};
-```
-
-**Loop unrolling example:**
-
-```cpp
-template<typename Hints>
-void shift_loop(uint32_t& mantissa, int count) {
-    if constexpr (Hints::hint_unroll) {
-        #pragma GCC unroll 4
-        for (int i = 0; i < count; i++) {
-            mantissa >>= 1;
-        }
-    } else {
-        for (int i = 0; i < count; i++) {
-            mantissa >>= 1;
-        }
+template<typename Traits>
+class FloatEngine {
+public:
+    static storage_type multiply(storage_type a, storage_type b) {
+        // Dispatch to selected implementation
+        return Traits::implementation::multiply(a, b);
     }
-}
-```
-
-**Interactions**:
-- Hardware capabilities inform hints
-- Type selection affects intermediate storage size
-- Lookup table preference trades memory for speed
-
-### 7.9 Operation Set
-
-Defines which operations are available.
-
-**Basic operations:**
-- Addition, subtraction, multiplication, division
-
-**Extended operations:**
-- Square root
-- Fused multiply-add (FMA)
-- Remainder/modulo
-
-**Transcendental functions:**
-- sin, cos, tan
-- log, log10, log2
-- exp, exp2, exp10
-- pow, hypot
-
-**Conversions:**
-- To/from integers
-- Between float formats
-- To/from strings
-
-**Comparisons:**
-- Ordered comparisons (<, <=, >, >=, ==, !=)
-- Unordered comparisons (handling NaN)
-
-**Why configurable**: Not all operations are needed. Embedded systems may only need basic arithmetic. Including unused operations wastes code space.
-
-**Example:**
-
-```cpp
-// Minimal operation set
-struct MinimalOps {
-    static constexpr bool has_add = true;
-    static constexpr bool has_sub = true;
-    static constexpr bool has_mul = true;
-    static constexpr bool has_div = true;
-    static constexpr bool has_sqrt = false;
-    static constexpr bool has_fma = false;
-    static constexpr bool has_transcendentals = false;
-};
-
-// Extended operation set
-struct ExtendedOps {
-    static constexpr bool has_add = true;
-    static constexpr bool has_sub = true;
-    static constexpr bool has_mul = true;
-    static constexpr bool has_div = true;
-    static constexpr bool has_sqrt = true;
-    static constexpr bool has_fma = true;
-    static constexpr bool has_transcendentals = false;
 };
 ```
 
-**Interactions**:
-- Some operations require others (tan needs sin and cos)
-- sqrt may need extra guard bits for accuracy
-- FMA (fused multiply-add) benefits from extra intermediate precision
-
-### 7.10 Integer Arithmetic Strategy
-
-Defines how integer multiply and divide operations are performed during floating point calculations.
-
-**Why this matters**: Floating point multiplication requires mantissa multiplication. On platforms without hardware multiply, this is the dominant cost. The strategy depends critically on operand bit width.
-
-**Multiply strategies:**
-
-- **Hardware**: Single instruction (1-3 cycles on most platforms)
-- **Lookup table**: Pre-computed table for small bit widths
-- **Shift-and-add**: Iterative algorithm, N iterations for N-bit multiply
-- **Booth's algorithm**: Fewer iterations than naive shift-and-add
-- **Russian peasant**: Alternative iterative approach
-- **Hybrid**: Choose based on operand size at compile time
-
-**Divide strategies:**
-
-- **Hardware**: Single instruction (typically 12-40 cycles)
-- **Reciprocal lookup + multiply**: Table of 1/x values
-- **Shift-and-subtract**: Long division algorithm
-- **Newton-Raphson**: Iterative reciprocal approximation
-- **Goldschmidt**: Alternative iterative method
-
-**Policy definition:**
+The implementation policy provides the actual multiply function. Users can provide their own:
 
 ```cpp
-enum class IntMultiplyStrategy {
-    Hardware,
-    Lookup,
-    ShiftAndAdd,
-    Booth,
-    Hybrid
-};
-
-enum class IntDivideStrategy {
-    Hardware,
-    ReciprocalLookup,
-    ShiftAndSubtract,
-    Newton,
-    Goldschmidt
-};
-
-template<IntMultiplyStrategy MultStrat, IntDivideStrategy DivStrat>
-struct IntegerArithmeticPolicy {
-    static constexpr IntMultiplyStrategy multiply_strategy = MultStrat;
-    static constexpr IntDivideStrategy divide_strategy = DivStrat;
-    
-    // Lookup table size limits
-    static constexpr int max_multiply_table_bits = 10;  // Max 1024 entries
-    static constexpr int max_divide_table_bits = 8;     // Max 256 entries
-};
-```
-
-**Automatic strategy selection:**
-
-```cpp
-template<typename Traits, int BitsA, int BitsB>
-auto multiply_integers(uint_a, uint_b) {
-    constexpr int total_bits = BitsA + BitsB;
-    
-    if constexpr (Traits::hardware::has_multiply) {
-        return uint_a * uint_b;  // Hardware instruction
+// Default implementation: pure C++
+template<typename Traits>
+struct DefaultOps {
+    static storage_type add(storage_type a, storage_type b) {
+        // Full C++ implementation using policies
+        auto [a_sign, a_exp, a_mant] = unpack<Traits>(a);
+        auto [b_sign, b_exp, b_mant] = unpack<Traits>(b);
         
-    } else if constexpr (total_bits <= Traits::int_arith::max_multiply_table_bits) {
-        // Use lookup table
-        int index = (uint_a << BitsB) | uint_b;
-        return multiply_table[index];
+        // Handle special values if enabled
+        if constexpr (Traits::specials::has_nan) {
+            if (is_nan(a_exp, a_mant)) return a;
+            if (is_nan(b_exp, b_mant)) return b;
+        }
         
-    } else {
-        // Fall back to shift-and-add
-        return shift_add_multiply(uint_a, uint_b, BitsA);
+        // Align exponents, add mantissas, normalize, round
+        // ... implementation details ...
+        
+        return pack<Traits>(sign, exp, mant);
     }
-}
+    
+    static storage_type multiply(storage_type a, storage_type b) {
+        // Full C++ implementation
+        // ...
+    }
+};
+
+// Platform override: use hand-optimized assembly for specific operations
+template<typename Traits>
+struct MOS6502_FastOps {
+    // Use C++ for most operations
+    static storage_type add(storage_type a, storage_type b) {
+        return DefaultOps<Traits>::add(a, b);
+    }
+    
+    // Override multiply with assembly
+    static storage_type multiply(storage_type a, storage_type b) {
+        extern storage_type float_mul_asm(storage_type, storage_type);
+        return float_mul_asm(a, b);
+    }
+};
 ```
 
-**Lookup table example for FP8 E5M2:**
+**Platform examples:**
 
-With 2-bit mantissa + implicit bit = 3-bit values (0-7), multiply table is 3+3=6 bits = 64 entries:
+Apple II using Wozniak's ROM routines:
+- JSR $E7BE for FADD (floating add)
+- JSR $E97F for FMUL (floating multiply)
+- JSR $EA66 for FDIV (floating divide)
+- Result: ~50 bytes wrapper code, rest is in ROM
+
+6502 with lookup tables for FP8 E5M2:
+
+With 2-bit mantissa + implicit bit = 3-bit values (0-7), the multiply table is 3+3=6 bits = 64 entries:
 
 ```cpp
 // 64-byte table for 3×3 bit multiplication
@@ -972,455 +605,612 @@ const uint8_t multiply_3x3_table[64] = {
     0,  7, 14, 21, 28, 35, 42, 49    // 7×0 through 7×7
 };
 
-// Usage (6502 assembly):
-// lda mantissa_a    ; 3 cycles
-// asl               ; 2 cycles
-// asl               ; 2 cycles  
-// asl               ; 2 cycles
-// ora mantissa_b    ; 3 cycles
-// tax               ; 2 cycles
-// lda multiply_3x3_table,x  ; 4 cycles
-// ; Result in A, total: 18 cycles
+// Usage in multiply operation:
+// Extract 3-bit mantissas (with implicit bit)
+// Compute index: (mantissa_a << 3) | mantissa_b
+// Result: multiply_3x3_table[index]
 ```
 
-**Performance comparison for E5M2 on 6502:**
+In 6502 assembly, the table lookup takes approximately 18 cycles compared to ~80 cycles for a generic 8×8 software multiply - a 4.4× speedup. This table is generated automatically by the library based on the format's mantissa bit width.
 
-- Generic 8×8 multiply (shift-and-add): ~80 cycles
-- 3×3 multiply with lookup: ~18 cycles
-- **Speedup: 4.4×**
-
-This 18-cycle multiply enables the ~78 cycle total for FP8 E5M2 multiplication, making floating point competitive with integer-only code on 8-bit platforms.
-
-**Interactions:**
-- Lookup table strategy requires ROM/flash space
-- Table size grows as 2^(BitsA + BitsB)
-- Hardware capability policy determines if lookup is needed
-- Mantissa bit width from format policy determines table size
-
-### 7.11 Implementation Strategy
-
-Defines where operation implementations come from.
-
-**This is the key to platform integration.**
-
-**Available strategies:**
-
-- **Pure C++**: Template-generated code (default)
-- **Inline assembly**: Assembly embedded in C++ functions
-- **External assembly**: Separate .s files linked in
-- **ROM routines**: Platform firmware calls
-- **Intrinsics**: Compiler built-ins
-- **Hardware**: Native float operations
-- **External library**: Link to existing libm or similar
-- **Hybrid**: Mix strategies per operation
-
-**Implementation policy:**
+The general algorithm for automatic lookup table strategy selection:
 
 ```cpp
-template<typename OperationSet>
-struct ImplementationPolicy {
-    using operations = OperationSet;
-};
-
-// Default: pure C++ implementation
-template<typename Traits>
-struct DefaultOps {
-    static storage_type add(storage_type a, storage_type b) {
-        // Full C++ implementation using policies
-    }
+template<typename Traits, int BitsA, int BitsB>
+auto multiply_integers(uint_a, uint_b) {
+    constexpr int total_bits = BitsA + BitsB;
     
-    static storage_type mul(storage_type a, storage_type b) {
-        // Full C++ implementation
-    }
-    
-    // ... all operations
-};
-```
-
-**Platform override example (hand-optimized assembly):**
-
-```cpp
-// 6502 with hand-optimized multiply
-template<typename Traits>
-struct MOS6502_FastOps {
-    // Use C++ for most operations
-    using Base = DefaultOps<Traits>;
-    
-    static storage_type add(storage_type a, storage_type b) {
-        return Base::add(a, b);  // Use C++
-    }
-    
-    static storage_type sub(storage_type a, storage_type b) {
-        return Base::sub(a, b);  // Use C++
-    }
-    
-    // Override multiply with assembly
-    static storage_type mul(storage_type a, storage_type b) {
-        extern storage_type float_mul_asm(storage_type, storage_type);
-        return float_mul_asm(a, b);
-    }
-    
-    static storage_type div(storage_type a, storage_type b) {
-        return Base::div(a, b);  // Use C++
-    }
-};
-```
-
-**ROM routine example (Apple II):**
-
-```cpp
-// Apple II using Wozniak's ROM routines
-template<typename Traits>
-struct AppleII_WozOps {
-    static storage_type add(storage_type a, storage_type b) {
-        // Set FAC = a, ARG = b
-        // JSR $E7BE (FADD in ROM)
-        // Return result from FAC
-        __asm__ volatile (
-            "lda %1+0\n"
-            "sta $9D\n"  // FAC
-            "lda %1+1\n"
-            "sta $9E\n"
-            "lda %1+2\n"
-            "sta $9F\n"
-            "lda %1+3\n"
-            "sta $A0\n"
-            "lda %2+0\n"
-            "sta $A5\n"  // ARG
-            "lda %2+1\n"
-            "sta $A6\n"
-            "lda %2+2\n"
-            "sta $A7\n"
-            "lda %2+3\n"
-            "sta $A8\n"
-            "jsr $E7BE\n"  // FADD
-            "lda $9D\n"
-            "sta %0+0\n"
-            "lda $9E\n"
-            "sta %0+1\n"
-            "lda $9F\n"
-            "sta %0+2\n"
-            "lda $A0\n"
-            "sta %0+3\n"
-            : "=m" (result)
-            : "m" (a), "m" (b)
-            : "a"
-        );
-        return result;
-    }
-    
-    static storage_type mul(storage_type a, storage_type b) {
-        // Similar, JSR $E97F (FMUL)
-    }
-    
-    // ... etc
-};
-```
-
-**Why this works:**
-
-The implementation policy is just another template parameter. Platform maintainers provide their own operation structs. The library selects them through traits. No core library changes needed.
-
-**Calling convention requirements:**
-
-Platform-specific implementations must match the calling convention:
-- Parameter passing (registers, stack, zero-page)
-- Return value location
-- Preserved registers
-- Stack alignment
-
-The trait system can encode these requirements and validate at compile time.
-
-**Testing strategy:**
-
-Every platform-specific implementation should be validated against the C++ reference:
-
-```cpp
-template<typename Traits>
-void validate_implementation() {
-    using CPP = DefaultOps<Traits>;
-    using Platform = /* platform ops */;
-    
-    // Test all input combinations
-    for (auto a : test_values) {
-        for (auto b : test_values) {
-            auto cpp_result = CPP::mul(a, b);
-            auto platform_result = Platform::mul(a, b);
-            assert(cpp_result == platform_result);
-        }
+    if constexpr (Traits::hardware::has_multiply) {
+        // Hardware multiply available: use it
+        return uint_a * uint_b;
+        
+    } else if constexpr (total_bits <= Traits::int_arith::max_table_bits) {
+        // Small enough for lookup table
+        int index = (uint_a << BitsB) | uint_b;
+        return multiply_table[index];
+        
+    } else {
+        // Too large: use software multiply
+        return shift_add_multiply(uint_a, uint_b, BitsA);
     }
 }
 ```
 
-## 8. Policy Grouping
+The policy system allows platform maintainers to configure the maximum table size (trading ROM space for speed) and the library automatically chooses the best approach.
 
-### The Problem
+x86 with SSE/AVX:
+- Vectorize operations across multiple values
+- Use native hardware float instructions
+- Platform-specific implementation ~10× faster than generic
 
-A complete configuration requires 10 policy dimensions:
+**Integration process:**
+
+1. Write operation struct matching expected interface
+2. Specialize implementation selector for your platform
+3. Test against generic implementation to verify correctness
+4. Build system includes platform-specific files
+
+No core library changes required. Platform maintainers contribute optimizations independently.
+
+### 11. Testing Strategy
+
+**The testing challenge:**
+
+With many formats and many policy combinations, exhaustive manual testing is impossible. The solution combines automatic enumeration with format-specific strategies.
+
+**Exhaustive testing:**
+
+Small formats enable complete testing:
+- FP8: 256 values, 256×256 = 65,536 input pairs per operation
+- Test all operations: ~260,000 total tests, runs in seconds
+- Result: Mathematical proof of correctness
+
+FP16 is tractable (4.3 billion cases, takes hours). Larger formats require sampling.
+
+**Policy enumeration:**
+
+Template metaprogramming generates all valid policy combinations automatically:
 
 ```cpp
-FloatEngine<
-    FormatPolicy<1, 8, 23>,
-    SpecialValuePolicy<true, true, true, true>,
-    RoundingPolicy<ToNearest>,
-    GuardBitsPolicy<3>,
-    ErrorPolicy<LocalFlags>,
-    StorageLayoutPolicy<IEEE>,
-    HardwarePolicy<MOS6502>,
-    CodeGenHintsPolicy<MOS6502>,
-    OperationSetPolicy<BasicOps>,
-    ImplementationPolicy<DefaultOps>
+CartesianProduct<
+    AllFormats,
+    AllRoundingModes,
+    AllSpecialValues,
+    AllGuardBits
 >
 ```
 
-This is unworkable. Template error messages are illegible. Changing one policy requires retyping everything. Users make mistakes in parameter order.
+Each combination instantiates test code at compile time. Invalid combinations filtered out via compile-time validation.
 
-### Solution: Trait Bundles
+**Testing as a policy:**
 
-Group related policies into trait structs:
+Test strategy is itself a policy dimension:
+- Format size ≤ 8 bits: Exhaustive
+- Format size ≤ 16 bits: Edge cases plus sampling
+- Format size > 16 bits: Targeted plus random sampling
 
-```cpp
-struct IEEE754_Binary32_Traits {
-    // Format cluster
-    using format = FormatPolicy<1, 8, 23>;
-    
-    // Special values cluster
-    using specials = SpecialValuePolicy<true, true, true, true>;
-    
-    // Arithmetic behavior cluster
-    using rounding = RoundingPolicy<ToNearest>;
-    using guard_bits = GuardBitsPolicy<3>;
-    using normalization = NormalizationPolicy<Always>;
-    
-    // Error management
-    using errors = ErrorPolicy<LocalFlags>;
-    
-    // Storage (usually default)
-    using storage = StorageLayoutPolicy<IEEE>;
-    
-    // Platform (must specify)
-    using hardware = HardwarePolicy<x86_64>;
-    using codegen = CodeGenHintsPolicy<x86_64>;
-    
-    // Operations
-    using operations = OperationSetPolicy<BasicOps>;
-    using implementation = ImplementationPolicy<DefaultOps>;
-};
+The library selects appropriate testing automatically based on format.
 
-// Usage: single parameter
-FloatEngine<IEEE754_Binary32_Traits>
+**Cross-validation:**
+
+Multiple strategies ensure correctness:
+- Fast configuration tested against accurate configuration
+- Accurate tested against IEEE compliant
+- Platform assembly tested against generic C++
+- All tests must agree
+
+**Property testing:**
+
+Regardless of policies, certain properties must hold:
+- Commutativity: a + b = b + a
+- Associativity: (a + b) + c ≈ a + (b + c) within tolerance
+- Identity: a + 0 = a, a × 1 = a
+- Monotonicity: if a < b then a × c < b × c (for positive c)
+
+Properties validate that implementations are mathematically reasonable even when not bit-exact.
+
+## Part V: Practical Guidance
+
+### 12. Adding Platform Support
+
+**For platform maintainers:**
+
+Adding optimized implementations requires:
+
+1. **Define platform traits**: Hardware capabilities, preferred integer widths, lookup table preferences
+2. **Write operation structs**: Provide implementations for operations you want to optimize
+3. **Specify implementation policy**: Associate your operations with your platform
+4. **Validate**: Test against generic implementation, ensure bit-exact agreement
+5. **Document**: Calling conventions, performance characteristics, limitations
+
+**Calling convention considerations:**
+
+Platform-specific code must match calling conventions:
+- LLVM-MOS: First 32 bits in rc0-rc3 (zero page)
+- ARM AAPCS: First 4 args in r0-r3
+- x86-64 SysV: First 6 args in rdi, rsi, rdx, rcx, r8, r9
+
+The implementation policy can enforce conventions via static_assert.
+
+**Build integration:**
+
+CMake or similar build systems conditionally include platform files:
+
+```cmake
+if(TARGET_PLATFORM STREQUAL "MOS6502")
+    set(PLATFORM_SOURCES platforms/mos6502/float_ops.s)
+    enable_language(ASM)
+endif()
 ```
 
-### Policy Groups
+Platform code is isolated in separate directories, doesn't pollute core library.
 
-Further simplify by grouping policies that commonly change together:
+### 13. Future Directions
+
+**Transcendental functions:**
+
+Extending to sin, cos, log, exp, pow requires:
+- Range reduction strategies (policy choice)
+- Approximation methods: polynomial, CORDIC, lookup tables
+- Accuracy targets: 0.5 ulp, 1 ulp, 2 ulp (policy choice)
+- Table size vs computation time tradeoffs
+
+Same policy-based approach applies. Function-specific policies control tradeoffs.
+
+**Fixed-point types:**
+
+The same policy framework extends to fixed-point:
+- Integer bits and fractional bits (analogous to exponent and mantissa)
+- Rounding modes during operations
+- Overflow handling: saturate, wrap, error
+- Similar performance benefits on constrained platforms
+
+**SIMD and vectorization:**
+
+Where hardware supports parallel operations:
+- Operations on arrays of floats
+- Platform-specific implementations using intrinsics
+- Maintain same policy-based interface
+- Automatic vectorization as implementation policy choice
+
+**Format conversion matrices:**
+
+For N formats, automatic generation of N² conversion functions. Testing ensures conversions preserve properties (monotonicity, special values, rounding).
+
+## Appendices
+
+### A. Policy Reference with Code Examples
+
+This appendix provides detailed code examples showing how policies are defined and composed.
+
+#### A.1 Format Policies
+
+**FormatPolicy - Core format specification:**
 
 ```cpp
-// Format group: structure + vocabulary
 template<int S, int E, int M>
-struct FormatGroup {
-    using structure = FormatPolicy<S, E, M>;
-    using implicit_bit = ImplicitBitPolicy<true>;
-    using exponent_bias = ExponentBiasPolicy<-1>;  // Standard
+struct FormatPolicy {
+    static constexpr int sign_bits = S;
+    static constexpr int exponent_bits = E;
+    static constexpr int mantissa_bits = M;
+    static constexpr int total_bits = S + E + M;
+    
+    // Type selection based on bit requirements
+    using storage_type = typename SelectIntType<total_bits>::type;
+    using mantissa_type = typename SelectIntType<M>::type;
+    using exponent_type = typename SelectIntType<E>::type;
+    
+    // Computation types (with extra bits for intermediate values)
+    template<int GuardBits>
+    using mantissa_compute_type = typename SelectIntType<M + GuardBits>::type;
+    
+    using exponent_compute_type = typename SelectIntType<E + 2>::type;
 };
 
-// Compliance group: special values + handling + errors
-struct ComplianceGroup_Full {
-    using specials = SpecialValuePolicy<true, true, true, true>;
-    using special_handling = SpecialHandlingPolicy<IEEE754>;
-    using errors = ErrorPolicy<LocalFlags>;
+// Example instantiations:
+using FP8_Format = FormatPolicy<1, 5, 2>;      // 8-bit total
+using FP16_Format = FormatPolicy<1, 5, 10>;    // 16-bit total
+using FP32_Format = FormatPolicy<1, 8, 23>;    // 32-bit total
+```
+
+**ExponentBiasPolicy:**
+
+```cpp
+template<int BiasValue>
+struct ExponentBiasPolicy {
+    static constexpr int bias = BiasValue;
+    
+    // Special value -1 means "use standard bias"
+    // Standard bias = 2^(exponent_bits - 1) - 1
 };
 
-struct ComplianceGroup_Minimal {
-    using specials = SpecialValuePolicy<false, false, false, false>;
-    using special_handling = SpecialHandlingPolicy<None>;
-    using errors = ErrorPolicy<None>;
+// Standard bias (auto-calculated)
+using StandardBias = ExponentBiasPolicy<-1>;
+
+// Custom bias
+using CustomBias = ExponentBiasPolicy<15>;
+```
+
+**ImplicitBitPolicy:**
+
+```cpp
+template<bool HasImplicitBit>
+struct ImplicitBitPolicy {
+    static constexpr bool has_implicit_bit = HasImplicitBit;
+    
+    // IEEE 754 formats have implicit leading 1
+    // Some historical formats store mantissa explicitly
 };
 
-// Arithmetic group: rounding + guard bits + normalization
-struct ArithmeticGroup_Accurate {
-    using rounding = RoundingPolicy<ToNearest>;
-    using guard_bits = GuardBitsPolicy<8>;
-    using normalization = NormalizationPolicy<Always>;
+using IEEE_ImplicitBit = ImplicitBitPolicy<true>;
+using Explicit_ImplicitBit = ImplicitBitPolicy<false>;
+```
+
+#### A.2 Special Value Policies
+
+**SpecialValuePolicy - Which special values exist:**
+
+```cpp
+template<bool NaN, bool Inf, bool SignedZero, bool Denormals>
+struct SpecialValuePolicy {
+    static constexpr bool has_nan = NaN;
+    static constexpr bool has_infinity = Inf;
+    static constexpr bool has_signed_zero = SignedZero;
+    static constexpr bool has_denormals = Denormals;
 };
 
-struct ArithmeticGroup_Fast {
-    using rounding = RoundingPolicy<TowardZero>;
-    using guard_bits = GuardBitsPolicy<0>;
-    using normalization = NormalizationPolicy<Lazy>;
+// IEEE 754 full compliance
+using IEEE_Specials = SpecialValuePolicy<true, true, true, true>;
+
+// Fast path: no special values
+using NoSpecials = SpecialValuePolicy<false, false, false, false>;
+
+// ML formats: NaN but no Inf/denormals
+using ML_E4M3_Specials = SpecialValuePolicy<true, false, true, false>;
+```
+
+**SpecialHandlingPolicy - What to do with special values:**
+
+```cpp
+enum class NaNHandling { Propagate, FlushToMax, Error };
+enum class InfHandling { IEEE754, Saturate, Error };
+enum class DenormalMode { FullSupport, FTZ, FIZ, FOZ, None };
+
+template<
+    NaNHandling NaN_Mode,
+    InfHandling Inf_Mode, 
+    DenormalMode Denorm_Mode
+>
+struct SpecialHandlingPolicy {
+    static constexpr NaNHandling nan_handling = NaN_Mode;
+    static constexpr InfHandling inf_handling = Inf_Mode;
+    static constexpr DenormalMode denormal_mode = Denorm_Mode;
 };
 
-// Platform group: hardware + codegen + implementation
-template<typename Arch>
-struct PlatformGroup {
-    using hardware = HardwarePolicy<Arch>;
-    using codegen = CodeGenHintsPolicy<Arch>;
-    using operations = OperationSetPolicy<BasicOps>;
-    using implementation = ImplementationPolicy<DefaultOps<Arch>>;
+// IEEE 754 compliant
+using IEEE_Handling = SpecialHandlingPolicy<
+    NaNHandling::Propagate,
+    InfHandling::IEEE754,
+    DenormalMode::FullSupport
+>;
+
+// Fast mode
+using FastHandling = SpecialHandlingPolicy<
+    NaNHandling::FlushToMax,
+    InfHandling::Saturate,
+    DenormalMode::FTZ
+>;
+```
+
+#### A.3 Arithmetic Policies
+
+**RoundingPolicy:**
+
+```cpp
+enum class RoundingMode {
+    ToNearest_TiesToEven,      // IEEE 754 default
+    ToNearest_TiesAwayFromZero,
+    TowardZero,                 // Truncate
+    TowardPositive,             // Ceiling
+    TowardNegative              // Floor
+};
+
+template<RoundingMode Mode>
+struct RoundingPolicy {
+    static constexpr RoundingMode mode = Mode;
+    static constexpr bool needs_guard_bits = (Mode != RoundingMode::TowardZero);
+};
+
+// Common aliases
+using RoundToNearest = RoundingPolicy<RoundingMode::ToNearest_TiesToEven>;
+using RoundTowardZero = RoundingPolicy<RoundingMode::TowardZero>;
+```
+
+**GuardBitsPolicy:**
+
+```cpp
+template<int N>
+struct GuardBitsPolicy {
+    static constexpr int guard_bits = N;
+    
+    // IEEE 754 requires 3 guard bits (Guard, Round, Sticky)
+    // Some platforms prefer full byte (8 bits) for efficiency
+    // High-precision algorithms may use 16 or more
+};
+
+using NoGuardBits = GuardBitsPolicy<0>;
+using IEEE_GuardBits = GuardBitsPolicy<3>;
+using ByteGuardBits = GuardBitsPolicy<8>;
+```
+
+**NormalizationPolicy:**
+
+```cpp
+enum class NormalizationTiming { Always, Lazy, Never };
+
+template<NormalizationTiming Timing>
+struct NormalizationPolicy {
+    static constexpr NormalizationTiming timing = Timing;
+    static constexpr bool normalize_on_pack = (Timing != NormalizationTiming::Never);
+    static constexpr bool normalize_during_ops = (Timing == NormalizationTiming::Always);
 };
 ```
 
-**Simplified trait definition:**
+#### A.4 Error Policies
+
+**ErrorDetectionPolicy:**
 
 ```cpp
 template<
-    typename Format,
-    typename Compliance,
-    typename Arithmetic,
-    typename Platform
+    bool TrackInvalid,
+    bool TrackDivByZero,
+    bool TrackOverflow,
+    bool TrackUnderflow,
+    bool TrackInexact
 >
-struct StandardTraits {
-    // Unpack groups
-    using format = typename Format::structure;
-    using implicit_bit = typename Format::implicit_bit;
-    using exponent_bias = typename Format::exponent_bias;
+struct ErrorDetectionPolicy {
+    static constexpr bool track_invalid = TrackInvalid;
+    static constexpr bool track_div_by_zero = TrackDivByZero;
+    static constexpr bool track_overflow = TrackOverflow;
+    static constexpr bool track_underflow = TrackUnderflow;
+    static constexpr bool track_inexact = TrackInexact;
     
-    using specials = typename Compliance::specials;
-    using special_handling = typename Compliance::special_handling;
-    using errors = typename Compliance::errors;
-    
-    using rounding = typename Arithmetic::rounding;
-    using guard_bits = typename Arithmetic::guard_bits;
-    using normalization = typename Arithmetic::normalization;
-    
-    using hardware = typename Platform::hardware;
-    using codegen = typename Platform::codegen;
-    using operations = typename Platform::operations;
-    using implementation = typename Platform::implementation;
+    static constexpr bool tracks_any_error = 
+        TrackInvalid || TrackDivByZero || TrackOverflow || 
+        TrackUnderflow || TrackInexact;
 };
 
-// Usage: 4 parameters instead of 10+
-using MyFloat = FloatEngine<StandardTraits<
-    FormatGroup<1, 8, 23>,
-    ComplianceGroup_Minimal,
-    ArithmeticGroup_Fast,
-    PlatformGroup<MOS6502>
->>;
+// No error tracking
+using NoErrorDetection = ErrorDetectionPolicy<false, false, false, false, false>;
+
+// IEEE 754 full tracking
+using IEEE_ErrorDetection = ErrorDetectionPolicy<true, true, true, true, true>;
+
+// Critical errors only
+using CriticalErrorDetection = ErrorDetectionPolicy<true, true, false, false, false>;
 ```
 
-### Named Configurations
-
-Define complete preset configurations:
+**ErrorReportingPolicy:**
 
 ```cpp
-// IEEE 754 binary32
-using IEEE754_Binary32 = StandardTraits<
-    FormatGroup<1, 8, 23>,
-    ComplianceGroup_Full,
-    ArithmeticGroup_Accurate,
-    PlatformGroup<NativePlatform>
->;
+enum class ErrorReportingMode {
+    None,           // No reporting
+    Errno,          // Set errno (not thread-safe)
+    Exception,      // Throw C++ exception
+    LocalFlags,     // Return status with result
+    GlobalFlags,    // Thread-local status register
+    Callback        // Call registered handler
+};
 
-// Fast 6502 float
-using C64_Fast = StandardTraits<
-    FormatGroup<1, 8, 23>,
-    ComplianceGroup_Minimal,
-    ArithmeticGroup_Fast,
-    PlatformGroup<MOS6502>
->;
-
-// Usage: single name
-FloatEngine<IEEE754_Binary32>
-FloatEngine<C64_Fast>
+template<ErrorReportingMode Mode>
+struct ErrorReportingPolicy {
+    static constexpr ErrorReportingMode mode = Mode;
+    
+    // For LocalFlags mode: result type becomes pair<value, status>
+    // For Exception mode: requires exception support
+    // For GlobalFlags mode: uses thread_local storage
+};
 ```
 
-### Selective Override
+#### A.5 Platform Policies
 
-Inherit from base trait and override specific policies:
+**HardwareCapabilitiesPolicy:**
 
 ```cpp
-// Start with IEEE 754 binary32
-struct MyCustomFloat : IEEE754_Binary32_Traits {
-    // Override: disable denormals for speed
-    using specials = SpecialValuePolicy<
-        true,   // Keep NaN
-        true,   // Keep Infinity
-        true,   // Keep signed zeros
-        false   // No denormals
+template<
+    bool HasMultiply,
+    bool HasDivide,
+    bool HasBarrelShift,
+    bool HasCLZ,        // Count leading zeros
+    bool HasSIMD
+>
+struct HardwareCapabilitiesPolicy {
+    static constexpr bool has_multiply = HasMultiply;
+    static constexpr bool has_divide = HasDivide;
+    static constexpr bool has_barrel_shift = HasBarrelShift;
+    static constexpr bool has_clz = HasCLZ;
+    static constexpr bool has_simd = HasSIMD;
+};
+
+// MOS 6502
+using MOS6502_Hardware = HardwareCapabilitiesPolicy<
+    false,  // No multiply
+    false,  // No divide
+    false,  // No barrel shift
+    false,  // No CLZ
+    false   // No SIMD
+>;
+
+// ARM Cortex-M4
+using CortexM4_Hardware = HardwareCapabilitiesPolicy<
+    true,   // 1-cycle multiply
+    true,   // Hardware divide
+    true,   // Barrel shifter
+    true,   // CLZ instruction
+    false   // No SIMD (unless FPU)
+>;
+
+// x86-64
+using x86_64_Hardware = HardwareCapabilitiesPolicy<
+    true,   // Fast multiply
+    true,   // Fast divide
+    true,   // Barrel shift
+    true,   // BSR/BSF (CLZ/CTZ)
+    true    // SSE/AVX
+>;
+```
+
+**IntegerArithmeticPolicy:**
+
+```cpp
+enum class IntMultiplyStrategy {
+    Hardware,
+    LookupTable,
+    ShiftAndAdd,
+    Booth,
+    Hybrid              // Choose based on operand size
+};
+
+enum class IntDivideStrategy {
+    Hardware,
+    ReciprocalLookup,
+    ShiftAndSubtract,
+    Newton,
+    Goldschmidt
+};
+
+template<
+    IntMultiplyStrategy MultStrat,
+    IntDivideStrategy DivStrat,
+    int MaxTableBits = 10
+>
+struct IntegerArithmeticPolicy {
+    static constexpr IntMultiplyStrategy multiply_strategy = MultStrat;
+    static constexpr IntDivideStrategy divide_strategy = DivStrat;
+    static constexpr int max_table_bits = MaxTableBits;
+    
+    // For lookup tables: 2^max_table_bits entries maximum
+    // Typical: 10 bits = 1024 entries = 1KB table
+};
+
+// 6502: prefer lookup tables
+using MOS6502_IntArith = IntegerArithmeticPolicy<
+    IntMultiplyStrategy::LookupTable,
+    IntDivideStrategy::ShiftAndSubtract,
+    8  // 256 bytes max
+>;
+
+// Modern CPU: use hardware
+using Modern_IntArith = IntegerArithmeticPolicy<
+    IntMultiplyStrategy::Hardware,
+    IntDivideStrategy::Hardware,
+    0  // No tables needed
+>;
+```
+
+#### A.6 Template Architecture Examples
+
+**Type Selection:**
+
+```cpp
+// Core type selection template
+template<int N>
+struct SelectIntType {
+    using type = 
+        std::conditional_t<(N <= 8), uint_least8_t,
+        std::conditional_t<(N <= 16), uint_least16_t,
+        std::conditional_t<(N <= 24), unsigned _BitInt(24),
+        std::conditional_t<(N <= 32), uint_least32_t,
+        uint_least64_t>>>>;
+};
+
+// Usage in FormatPolicy shown above demonstrates:
+// - storage_type sized for total bits
+// - Field types sized for individual fields  
+// - Compute types sized for intermediate values with guard bits
+
+// Example: FP8 E5M2 with 3 guard bits
+using FP8 = FormatPolicy<1, 5, 2>;
+// storage_type = uint8_t (8 bits total)
+// mantissa_type = uint8_t (2 bits)
+// exponent_type = uint8_t (5 bits)
+// mantissa_compute_type<3> = uint8_t (2 + 3 = 5 bits)
+// exponent_compute_type = uint8_t (5 + 2 = 7 bits)
+// All operations use fast 8-bit arithmetic
+```
+
+**Trait Composition:**
+
+```cpp
+// Individual policies combine into trait bundles
+template<
+    typename FormatPolicy,
+    typename SpecialValuePolicy,
+    typename SpecialHandlingPolicy,
+    typename RoundingPolicy,
+    typename GuardBitsPolicy,
+    typename NormalizationPolicy,
+    typename ErrorDetectionPolicy,
+    typename ErrorReportingPolicy,
+    typename HardwarePolicy,
+    typename IntArithPolicy,
+    typename ImplementationPolicy
+>
+struct FloatTraits {
+    using format = FormatPolicy;
+    using specials = SpecialValuePolicy;
+    using special_handling = SpecialHandlingPolicy;
+    using rounding = RoundingPolicy;
+    using guard_bits = GuardBitsPolicy;
+    using normalization = NormalizationPolicy;
+    using error_detection = ErrorDetectionPolicy;
+    using error_reporting = ErrorReportingPolicy;
+    using hardware = HardwarePolicy;
+    using int_arith = IntArithPolicy;
+    using implementation = ImplementationPolicy;
+};
+
+// Policy groups simplify composition
+template<int S, int E, int M>
+struct FormatGroup {
+    using format = FormatPolicy<S, E, M>;
+    using exponent_bias = ExponentBiasPolicy<-1>;
+    using implicit_bit = ImplicitBitPolicy<true>;
+};
+
+struct IEEE_ComplianceGroup {
+    using specials = IEEE_Specials;
+    using special_handling = IEEE_Handling;
+    using error_detection = IEEE_ErrorDetection;
+    using error_reporting = ErrorReportingPolicy<ErrorReportingMode::LocalFlags>;
+};
+
+struct FastArithmeticGroup {
+    using rounding = RoundTowardZero;
+    using guard_bits = NoGuardBits;
+    using normalization = NormalizationPolicy<NormalizationTiming::Lazy>;
+};
+
+template<typename HardwarePolicy>
+struct PlatformGroup {
+    using hardware = HardwarePolicy;
+    // Auto-select int arithmetic based on hardware
+    using int_arith = std::conditional_t<
+        HardwarePolicy::has_multiply,
+        Modern_IntArith,
+        MOS6502_IntArith
     >;
-    
-    // Override: flush denormals to zero
-    using special_handling = SpecialHandlingPolicy<FTZ>;
-};
-
-FloatEngine<MyCustomFloat>
-```
-
-### Strategy Summary
-
-1. **Individual policies**: Fine-grained control, verbose
-2. **Policy groups**: Cluster related policies, moderate verbosity
-3. **Trait bundles**: Named complete configurations, concise
-4. **Selective override**: Start with preset, modify specific aspects
-
-Use trait bundles for common cases. Use selective override for variations. Reserve individual policy specification for unusual requirements.
-
-## 9. Architecture
-
-### Template Structure
-
-The library consists of four layers:
-
-**Layer 1: Public Interface**
-
-```cpp
-template<typename Traits>
-class FloatEngine {
-public:
-    using storage_type = typename Traits::format::storage_type;
-    
-    static storage_type add(storage_type a, storage_type b);
-    static storage_type sub(storage_type a, storage_type b);
-    static storage_type mul(storage_type a, storage_type b);
-    static storage_type div(storage_type a, storage_type b);
-    
-    // Additional operations based on Traits::operations
 };
 ```
 
-Users interact only with this layer. All complexity is hidden.
-
-**Layer 2: Policy Extraction**
+**Implementation Selection:**
 
 ```cpp
-template<typename Traits>
-class FloatEngine {
-private:
-    // Extract all policies from traits
-    using format = typename Traits::format;
-    using rounding = typename Traits::rounding;
-    using guard_bits = typename Traits::guard_bits;
-    using specials = typename Traits::specials;
-    using errors = typename Traits::errors;
-    using implementation = typename Traits::implementation;
-    // ... etc
-    
-    // Derived types
-    using storage_type = typename format::storage_type;
-    using mantissa_type = typename format::mantissa_type;
-    using exponent_type = typename format::exponent_type;
-};
-```
-
-This layer unpacks trait bundles into individual policies. Type aliases computed from policies.
-
-**Layer 3: Operation Dispatch**
-
-```cpp
-template<typename Traits>
-storage_type FloatEngine<Traits>::add(storage_type a, storage_type b) {
-    // Dispatch to selected implementation
-    return implementation::operations::add(a, b);
-}
-```
-
-Operations delegate to the implementation selected by traits. This enables platform-specific optimization.
-
-**Layer 4: Implementation**
-
-```cpp
+// Default implementation uses pure C++
 template<typename Traits>
 struct DefaultOps {
+    using storage_type = typename Traits::format::storage_type;
+    
     static storage_type add(storage_type a, storage_type b) {
         // Unpack operands
         auto [a_sign, a_exp, a_mant] = unpack<Traits>(a);
@@ -1432,112 +1222,44 @@ struct DefaultOps {
             if (is_nan(b_exp, b_mant)) return b;
         }
         
-        // Align exponents
-        // Add mantissas
-        // Normalize
-        // Round based on Traits::rounding
-        // Pack result
+        // Align exponents, add mantissas, normalize, round
+        // ... full implementation using policies ...
         
-        return pack<Traits>(sign, exp, mant);
+        return pack<Traits>(result_sign, result_exp, result_mant);
+    }
+    
+    static storage_type multiply(storage_type a, storage_type b);
+    static storage_type divide(storage_type a, storage_type b);
+    // ... other operations
+};
+
+// Platform-specific override
+template<typename Traits>
+struct MOS6502_OptimizedOps : DefaultOps<Traits> {
+    using Base = DefaultOps<Traits>;
+    using storage_type = typename Traits::format::storage_type;
+    
+    // Use base class for most operations
+    using Base::add;
+    using Base::divide;
+    
+    // Override multiply with hand-optimized assembly
+    static storage_type multiply(storage_type a, storage_type b) {
+        extern storage_type float_mul_asm(storage_type, storage_type);
+        return float_mul_asm(a, b);
     }
 };
-```
 
-Actual arithmetic. Uses `if constexpr` for compile-time branches. Only code for enabled features is generated.
-
-### Type Selection
-
-Type selection based on bit requirements is critical for efficiency:
-
-```cpp
-// Select smallest integer type that fits N bits
-template<int N>
-struct SelectIntType {
-    using type = 
-        std::conditional_t<(N <= 8), uint_least8_t,
-        std::conditional_t<(N <= 16), uint_least16_t,
-        std::conditional_t<(N <= 24), unsigned _BitInt(24),
-        std::conditional_t<(N <= 32), uint_least32_t,
-        uint_least64_t>>>>;
-};
-
-// Format policy uses this
-template<int S, int E, int M>
-struct FormatPolicy {
-    static constexpr int sign_bits = S;
-    static constexpr int exponent_bits = E;
-    static constexpr int mantissa_bits = M;
-    static constexpr int total_bits = S + E + M;
-    
-    // Storage type: exactly sized for total bits
-    using storage_type = typename SelectIntType<total_bits>::type;
-    
-    // Field types: sized for individual fields
-    using mantissa_type = typename SelectIntType<M>::type;
-    using exponent_type = typename SelectIntType<E>::type;
-    
-    // Computation types: sized for intermediate values
-    using mantissa_compute_type = 
-        typename SelectIntType<M + guard_bits>::type;
-    using exponent_compute_type = 
-        typename SelectIntType<E + 2>::type;  // Extra for over/underflow
-};
-```
-
-**Why this matters:**
-
-On 6502 (8-bit operations fast, 16-bit slow, 32-bit very slow):
-- FP8 operations use only 8-bit arithmetic
-- 16-bit float uses 8-bit and 16-bit operations
-- 32-bit float requires some 32-bit operations
-
-Selecting the right types means the compiler generates optimal code for each format.
-
-**Example: FP8 E5M2**
-
-```cpp
-using FP8 = FormatPolicy<1, 5, 2>;
-
-// Generates:
-// storage_type = uint8_t (8 bits total)
-// mantissa_type = uint8_t (2 bits fit in 8)
-// exponent_type = uint8_t (5 bits fit in 8)
-// mantissa_compute_type = uint8_t (2 + 3 guard bits = 5, fits in 8)
-// exponent_compute_type = uint8_t (5 + 2 = 7, fits in 8)
-```
-
-All operations stay in 8-bit arithmetic. On 6502, this is extremely fast.
-
-**Example: IEEE 754 Binary32**
-
-```cpp
-using Binary32 = FormatPolicy<1, 8, 23>;
-
-// Generates:
-// storage_type = uint32_t (32 bits total)
-// mantissa_type = uint32_t (23 bits needs 32-bit)
-// exponent_type = uint8_t (8 bits fits in 8)
-// mantissa_compute_type = uint32_t (23 + 3 = 26, needs 32-bit)
-// exponent_compute_type = uint16_t (8 + 2 = 10, needs 16-bit)
-```
-
-Mantissa operations are 32-bit, exponent operations are 8-bit or 16-bit. Optimal for each field.
-
-### Implementation Selection
-
-How platform-specific implementations are chosen:
-
-```cpp
-// Default: use C++ implementation
+// Implementation selector
 template<typename Traits>
 struct SelectImplementation {
     using type = DefaultOps<Traits>;
 };
 
-// Specialization for specific platform + traits
+// Specializations for specific platforms
 template<>
 struct SelectImplementation<C64_Fast_Traits> {
-    using type = MOS6502_FastOps<C64_Fast_Traits>;
+    using type = MOS6502_OptimizedOps<C64_Fast_Traits>;
 };
 
 // FloatEngine uses selected implementation
@@ -1547,444 +1269,123 @@ private:
     using Impl = typename SelectImplementation<Traits>::type;
     
 public:
+    using storage_type = typename Traits::format::storage_type;
+    
     static storage_type add(storage_type a, storage_type b) {
         return Impl::add(a, b);
     }
-};
-```
-
-Platform maintainers add specializations for their platform. No core library changes.
-
-### Compile-Time Validation
-
-Policies are validated at compile time:
-
-```cpp
-template<typename Traits>
-struct ValidateTraits {
-    // Check policy interactions
-    static_assert(
-        !Traits::rounding::needs_rounding || 
-        Traits::guard_bits::guard_bits > 0,
-        "Rounding modes other than TowardZero require guard bits"
-    );
     
-    static_assert(
-        !Traits::specials::has_denormals || 
-        Traits::normalization::normalize_on_pack,
-        "Denormal support requires normalization on pack"
-    );
-    
-    static_assert(
-        Traits::format::sign_bits == 1,
-        "Sign must be exactly 1 bit"
-    );
-    
-    static_assert(
-        Traits::format::exponent_bits >= 2,
-        "Exponent must be at least 2 bits"
-    );
-    
-    // Many more checks...
-};
-
-// Validate when instantiating FloatEngine
-template<typename Traits>
-class FloatEngine {
-    ValidateTraits<Traits> _validate;
-    // ...
-};
-```
-
-Invalid configurations produce compiler errors with clear messages.
-
-## 10. Adding Platform Implementations
-
-### Writing Operation Structs
-
-Platform-specific operations are provided as structs with static functions:
-
-```cpp
-template<typename Traits>
-struct MyPlatform_Ops {
-    using storage_type = typename Traits::format::storage_type;
-    
-    static storage_type add(storage_type a, storage_type b) {
-        // Platform-specific implementation
-    }
-    
-    static storage_type mul(storage_type a, storage_type b) {
-        // Platform-specific implementation
-    }
-    
-    // Implement all required operations
-    // Or inherit from DefaultOps and override selectively
-};
-```
-
-**Selective override:**
-
-```cpp
-template<typename Traits>
-struct MyPlatform_Ops : DefaultOps<Traits> {
-    using Base = DefaultOps<Traits>;
-    
-    // Use C++ for most operations
-    using Base::add;
-    using Base::sub;
-    using Base::div;
-    
-    // Override just multiplication
-    static storage_type mul(storage_type a, storage_type b) {
-        // Hand-optimized version
+    static storage_type multiply(storage_type a, storage_type b) {
+        return Impl::multiply(a, b);
     }
 };
 ```
 
-### Calling Conventions
-
-Platform implementations must match calling conventions:
-
-**LLVM-MOS (6502):**
-- First 32 bits in rc0-rc3 (zero page)
-- Return value in rc0-rc3
-- Additional params on stack
-- Preserved: X, Y registers
-
-**Example:**
+**Pack/Unpack Operations:**
 
 ```cpp
-// C++ wrapper
+// Unpacking extracts fields from storage
 template<typename Traits>
-struct MOS6502_Ops {
-    static uint32_t mul(uint32_t a, uint32_t b) {
-        uint32_t result;
-        __asm__ volatile (
-            // a already in rc0-rc3
-            // b already in rc4-rc7
-            "jsr float_mul_asm\n"
-            // result in rc0-rc3
-            : "=r" (result)
-            : "r" (a), "r" (b)
-        );
-        return result;
-    }
+struct UnpackedFloat {
+    using exponent_type = typename Traits::format::exponent_type;
+    using mantissa_type = typename Traits::format::mantissa_type;
+    
+    bool sign;
+    exponent_type exponent;
+    mantissa_type mantissa;
+    
+    // Special value indicators
+    bool is_zero;
+    bool is_nan;
+    bool is_inf;
+    bool is_denormal;
 };
 
-// Assembly implementation (float_mul_asm.s)
-// .global float_mul_asm
-// float_mul_asm:
-//     ; rc0-rc3 = a
-//     ; rc4-rc7 = b
-//     ; ... multiply algorithm ...
-//     ; result in rc0-rc3
-//     rts
-```
-
-**ARM AAPCS:**
-- First 4 args in r0-r3
-- Return in r0 (or r0-r1 for 64-bit)
-- Preserved: r4-r11
-
-**x86-64 SysV:**
-- First 6 args in rdi, rsi, rdx, rcx, r8, r9
-- Return in rax (or xmm0 for float)
-- Preserved: rbx, rbp, r12-r15
-
-The operation struct must encode these requirements:
-
-```cpp
 template<typename Traits>
-struct ARM_Ops {
-    static_assert(
-        sizeof(typename Traits::format::storage_type) <= 8,
-        "ARM AAPCS passes up to 8 bytes in registers"
-    );
+UnpackedFloat<Traits> unpack(typename Traits::format::storage_type value) {
+    using Format = typename Traits::format;
     
-    // Implementation...
-};
-```
-
-### Testing Against C++ Reference
-
-Every platform implementation should be validated:
-
-```cpp
-template<typename Traits>
-bool validate_platform_ops() {
-    using CPP = DefaultOps<Traits>;
-    using Platform = /* platform ops */;
-    using storage_type = typename Traits::format::storage_type;
+    UnpackedFloat<Traits> result;
     
-    // Test data covering edge cases
-    std::vector<storage_type> test_values = {
-        0,                    // Zero
-        encode_max(),         // Max value
-        encode_min(),         // Min normalized
-        encode_denorm_min(),  // Min denormal (if supported)
-        // ... many more cases
-    };
+    // Extract bit fields
+    constexpr int mantissa_shift = 0;
+    constexpr int exponent_shift = Format::mantissa_bits;
+    constexpr int sign_shift = Format::mantissa_bits + Format::exponent_bits;
     
-    bool all_pass = true;
+    constexpr typename Format::mantissa_type mantissa_mask = 
+        (1u << Format::mantissa_bits) - 1;
+    constexpr typename Format::exponent_type exponent_mask = 
+        (1u << Format::exponent_bits) - 1;
     
-    // Test all operations
-    for (auto a : test_values) {
-        for (auto b : test_values) {
-            // Addition
-            auto cpp_add = CPP::add(a, b);
-            auto plat_add = Platform::add(a, b);
-            if (cpp_add != plat_add) {
-                log_mismatch("add", a, b, cpp_add, plat_add);
-                all_pass = false;
-            }
-            
-            // Multiplication
-            auto cpp_mul = CPP::mul(a, b);
-            auto plat_mul = Platform::mul(a, b);
-            if (cpp_mul != plat_mul) {
-                log_mismatch("mul", a, b, cpp_mul, plat_mul);
-                all_pass = false;
-            }
-            
-            // ... test other operations
+    result.mantissa = (value >> mantissa_shift) & mantissa_mask;
+    result.exponent = (value >> exponent_shift) & exponent_mask;
+    result.sign = (value >> sign_shift) & 1;
+    
+    // Detect special values based on policy
+    constexpr int exp_max = (1 << Format::exponent_bits) - 1;
+    
+    result.is_zero = (result.exponent == 0 && result.mantissa == 0);
+    
+    if constexpr (Traits::specials::has_nan || Traits::specials::has_infinity) {
+        bool exp_all_ones = (result.exponent == exp_max);
+        
+        if constexpr (Traits::specials::has_nan) {
+            result.is_nan = exp_all_ones && (result.mantissa != 0);
+        }
+        
+        if constexpr (Traits::specials::has_infinity) {
+            result.is_inf = exp_all_ones && (result.mantissa == 0);
         }
     }
     
-    return all_pass;
+    if constexpr (Traits::specials::has_denormals) {
+        result.is_denormal = (result.exponent == 0 && result.mantissa != 0);
+    }
+    
+    return result;
+}
+
+// Packing assembles storage from fields
+template<typename Traits>
+typename Traits::format::storage_type pack(
+    bool sign,
+    typename Traits::format::exponent_type exponent,
+    typename Traits::format::mantissa_type mantissa
+) {
+    using Format = typename Traits::format;
+    using storage_type = typename Format::storage_type;
+    
+    storage_type result = 0;
+    
+    result |= (mantissa & ((1u << Format::mantissa_bits) - 1));
+    result |= (static_cast<storage_type>(exponent & 
+               ((1u << Format::exponent_bits) - 1)) << Format::mantissa_bits);
+    result |= (static_cast<storage_type>(sign) << 
+               (Format::mantissa_bits + Format::exponent_bits));
+    
+    return result;
 }
 ```
 
-Run this test suite before merging platform-specific code.
+#### A.7 Conversion Policy Examples
 
-### Build Integration
-
-CMake example:
-
-```cmake
-# Platform-specific sources
-if(TARGET_PLATFORM STREQUAL "MOS6502")
-    set(PLATFORM_SOURCES
-        platforms/mos6502/float_ops_asm.s
-        platforms/mos6502/float_ops_wrapper.cpp
-    )
-    enable_language(ASM)
-    add_compile_definitions(HAVE_MOS6502_ASM)
-    
-elseif(TARGET_PLATFORM STREQUAL "ARM")
-    set(PLATFORM_SOURCES
-        platforms/arm/float_ops_neon.cpp
-    )
-    add_compile_definitions(HAVE_ARM_NEON)
-    
-endif()
-
-# Library
-add_library(float_engine
-    float_engine.cpp
-    float_impl_default.cpp
-    ${PLATFORM_SOURCES}
-)
-
-# LTO for dead code elimination
-set_target_properties(float_engine PROPERTIES
-    INTERPROCEDURAL_OPTIMIZATION TRUE
-)
-```
-
-Configuration header:
+**Conversion Policy Bundle:**
 
 ```cpp
-// float_config.h (generated by CMake)
-#ifndef FLOAT_CONFIG_H
-#define FLOAT_CONFIG_H
-
-#cmakedefine HAVE_MOS6502_ASM
-#cmakedefine HAVE_ARM_NEON
-#cmakedefine HAVE_X86_SSE
-
-#endif
-```
-
-Platform-specific selection:
-
-```cpp
-#include "float_config.h"
-
-template<typename Traits>
-struct SelectImplementation {
-    #ifdef HAVE_MOS6502_ASM
-        using type = MOS6502_Ops<Traits>;
-    #elif defined(HAVE_ARM_NEON)
-        using type = ARM_NEON_Ops<Traits>;
-    #else
-        using type = DefaultOps<Traits>;
-    #endif
-};
-```
-
-### Contributing Platform Code
-
-To add a new platform:
-
-1. Create `platforms/myplatform/` directory
-2. Implement operation struct in `myplatform_ops.cpp`
-3. Add assembly files if needed
-4. Create test file validating against C++ reference
-5. Update CMakeLists.txt to detect platform
-6. Document calling convention and requirements
-7. Submit PR with test results
-
-No core library changes required. Platform code is isolated.
-
-## 11. Format Conversion
-
-### The Conversion Problem
-
-Converting between floating point formats is critical for modern applications:
-
-**Machine learning workflows:**
-- Training in FP32, inference in FP8
-- Mixed-precision training (FP32 ↔ FP16)
-- Quantization (FP32 → FP8/FP6/FP4)
-
-**Legacy integration:**
-- Converting between IEEE 754 and historical formats
-- Apple II format ↔ modern formats
-- Microsoft BASIC format ↔ standard formats
-
-**Format experimentation:**
-- Researchers testing E4M3 vs E5M2 vs E3M4
-- Evaluating custom formats for specific domains
-- Optimizing format choice per layer in neural networks
-
-Conversion is complex because formats differ in:
-- **Range** (different exponent bits)
-- **Precision** (different mantissa bits)
-- **Special values** (NaN, Inf, denormals present or absent)
-- **Conventions** (signed zeros, exponent bias, FNUZ variants)
-
-### User Interface
-
-Conversions should require minimal code:
-
-```cpp
-// Implicit conversion (uses default policy)
-FloatEngine<FP32_Traits> src = ...;
-FloatEngine<FP8_E4M3_Traits> dst = src;  // Just works
-
-// Explicit conversion
-auto dst = static_cast<FloatEngine<FP8_E4M3_Traits>>(src);
-
-// With custom conversion policy
-auto dst = src.convert_to<FP8_E4M3_Traits, StrictConversionPolicy>();
-
-// Free function form
-auto dst = convert<FP8_E4M3_Traits>(src);
-auto dst = convert<FP8_E4M3_Traits, CustomPolicy>(src);
-```
-
-### Conversion Policies
-
-Conversion behavior is controlled by policies covering four dimensions:
-
-**1. Range Handling**
-
-What happens when source value exceeds destination range:
-
-```cpp
-enum class OverflowMode {
-    Saturate,     // Clip to destination max value
-    ToInfinity,   // Convert to Inf (if dest supports it)
-    Error         // Signal error via chosen mechanism
+template<
+    typename RangePolicy,
+    typename SpecialMappingPolicy,
+    typename PrecisionPolicy,
+    typename ErrorPolicy
+>
+struct ConversionPolicyBundle {
+    using range = RangePolicy;
+    using specials = SpecialMappingPolicy;
+    using precision = PrecisionPolicy;
+    using errors = ErrorPolicy;
 };
 
-enum class UnderflowMode {
-    FlushToZero,  // Convert to zero
-    ToDenormal,   // Use denormal representation (if dest supports it)
-    Error         // Signal error
-};
-
-template<OverflowMode Overflow, UnderflowMode Underflow>
-struct RangePolicy {
-    static constexpr OverflowMode overflow = Overflow;
-    static constexpr UnderflowMode underflow = Underflow;
-};
-```
-
-**2. Special Value Mapping**
-
-How to map special values when destination doesn't support them:
-
-```cpp
-struct SpecialMappingPolicy {
-    enum class NaNMapping {
-        Preserve,   // Keep as NaN if dest supports it
-        ToMax,      // Convert to max representable value
-        ToZero,     // Convert to zero
-        Error       // Signal error
-    };
-    
-    enum class InfMapping {
-        Preserve,   // Keep as Inf if dest supports it
-        ToMax,      // Convert to max representable value
-        Error       // Signal error
-    };
-    
-    enum class DenormalMapping {
-        Preserve,   // Keep as denormal if dest supports it
-        FlushToZero, // Convert to zero
-        Error       // Signal error
-    };
-    
-    static constexpr NaNMapping nan_mapping = ...;
-    static constexpr InfMapping inf_mapping = ...;
-    static constexpr DenormalMapping denormal_mapping = ...;
-};
-```
-
-**3. Precision Handling**
-
-When narrowing mantissa (e.g., FP32 23 bits → FP8 3 bits):
-
-```cpp
-struct PrecisionPolicy {
-    using rounding = RoundingPolicy<...>;      // How to round
-    using guard_bits = GuardBitsPolicy<...>;   // Intermediate precision
-};
-```
-
-Typically uses destination format's rounding policy, but can be overridden.
-
-**4. Error Handling**
-
-How to report conversion errors:
-
-```cpp
-enum class ConversionErrorMode {
-    Silent,         // Map to valid value, continue
-    SetFlag,        // Set thread-local status flag
-    Exception,      // Throw C++ exception
-    CompileError    // static_assert (when detectable at compile time)
-};
-
-template<ConversionErrorMode Mode>
-struct ConversionErrorPolicy {
-    static constexpr ConversionErrorMode mode = Mode;
-    
-    // What conditions trigger errors
-    static constexpr bool nan_is_error = false;
-    static constexpr bool inf_is_error = false;
-    static constexpr bool overflow_is_error = false;
-    static constexpr bool underflow_is_error = false;
-};
-```
-
-### Preset Conversion Policy Bundles
-
-Most users won't configure individual policies. Preset bundles cover common cases:
-
-```cpp
-// Safe: correctness over speed (default)
+// Safe conversion (default)
 struct SafeConversionPolicy {
     using range = RangePolicy<
         OverflowMode::Saturate,
@@ -1996,15 +1397,15 @@ struct SafeConversionPolicy {
         DenormalMapping::Preserve
     >;
     using precision = PrecisionPolicy<
-        RoundingPolicy<RoundingMode::ToNearest>,
-        GuardBitsPolicy<3>
+        RoundToNearest,
+        IEEE_GuardBits
     >;
-    using error_policy = ConversionErrorPolicy<
+    using errors = ConversionErrorPolicy<
         ConversionErrorMode::Silent
     >;
 };
 
-// Strict: error on any potential data loss
+// Strict conversion: error on any loss
 struct StrictConversionPolicy {
     using range = RangePolicy<
         OverflowMode::Error,
@@ -2016,1290 +1417,264 @@ struct StrictConversionPolicy {
         DenormalMapping::Error
     >;
     using precision = PrecisionPolicy<
-        RoundingPolicy<RoundingMode::ToNearest>,
-        GuardBitsPolicy<3>
+        RoundToNearest,
+        IEEE_GuardBits
     >;
-    using error_policy = ConversionErrorPolicy<
-        ConversionErrorMode::Exception
-    >;
-};
-
-// Fast: performance over exactness
-struct FastConversionPolicy {
-    using range = RangePolicy<
-        OverflowMode::Saturate,
-        UnderflowMode::FlushToZero
-    >;
-    using specials = SpecialMappingPolicy<
-        NaNMapping::ToMax,        // Skip NaN checks
-        InfMapping::ToMax,        // Skip Inf checks
-        DenormalMapping::FlushToZero
-    >;
-    using precision = PrecisionPolicy<
-        RoundingPolicy<RoundingMode::TowardZero>,  // Truncate
-        GuardBitsPolicy<0>
-    >;
-    using error_policy = ConversionErrorPolicy<
-        ConversionErrorMode::Silent
-    >;
-};
-
-// ML inference: training weights → inference weights
-struct MLInferenceConversionPolicy {
-    using range = RangePolicy<
-        OverflowMode::Saturate,   // Clip outliers
-        UnderflowMode::FlushToZero
-    >;
-    using specials = SpecialMappingPolicy<
-        NaNMapping::Error,        // NaN in weights indicates bug
-        InfMapping::ToMax,
-        DenormalMapping::FlushToZero
-    >;
-    using precision = PrecisionPolicy<
-        RoundingPolicy<RoundingMode::ToNearest>,
-        GuardBitsPolicy<3>
-    >;
-    using error_policy = ConversionErrorPolicy<
+    using errors = ConversionErrorPolicy<
         ConversionErrorMode::Exception
     >;
 };
 ```
 
-### Conversion Algorithm
-
-The generic conversion algorithm:
-
-1. **Unpack source** - extract sign, exponent, mantissa, special flags
-2. **Handle special values** - NaN, Inf, zero (policy-driven)
-3. **Adjust exponent bias** - convert from source bias to dest bias
-4. **Check range** - detect overflow/underflow (policy-driven)
-5. **Convert mantissa** - widen (shift left) or narrow (round)
-6. **Handle mantissa overflow** - rounding can cause mantissa overflow
-7. **Pack destination** - assemble result in destination format
-
-**Critical cases:**
-
-**Widening mantissa (FP8 → FP32):**
-- Shift left, pad with zeros
-- Exact conversion, no information loss
-
-**Narrowing mantissa (FP32 → FP8):**
-- Extract guard, round, sticky bits
-- Apply rounding policy
-- Check for mantissa overflow after rounding
-- If mantissa overflows, increment exponent and check for exponent overflow
-
-**Exponent adjustment:**
-- Unbias source exponent: `exp - source_bias`
-- Rebias for destination: `(exp - source_bias) + dest_bias`
-- Check result against destination exponent range
-
-**Special value mapping:**
-- Source NaN → Dest NaN (if supported), else max value or error
-- Source Inf → Dest Inf (if supported), else max value or error
-- Source denormal → Dest denormal (if supported), else flush to zero
-- Signed zero handling: map ±0 appropriately for FNUZ formats
-
-### Platform-Specific Conversion Implementations
-
-Like arithmetic operations, conversions can have platform-specific optimizations:
+**Conversion Function Signature:**
 
 ```cpp
-// Generic conversion (works everywhere)
-template<typename SrcTraits, typename DstTraits, typename ConvPolicy>
-struct GenericConversion {
-    static typename DstTraits::format::storage_type
-    convert(typename SrcTraits::format::storage_type src) {
-        // Full algorithm: unpack, convert, pack
-    }
-};
-
-// Platform-optimized conversion
-template<typename SrcTraits, typename DstTraits, typename ConvPolicy>
-struct MOS6502_E5M2_to_E4M3_Conversion {
-    static uint8_t convert(uint8_t src) {
-        // Lookup table approach
-        // E5M2 → E4M3 is 256-entry table
-        extern const uint8_t e5m2_to_e4m3_table[256];
-        return e5m2_to_e4m3_table[src];
-    }
-};
-
-// Conversion implementation selector
-template<typename SrcTraits, typename DstTraits, typename ConvPolicy>
-struct ConversionImplementation {
-    using type = GenericConversion<SrcTraits, DstTraits, ConvPolicy>;
-};
-
-// Specialization for optimized case
-template<>
-struct ConversionImplementation<
-    E5M2_Traits, 
-    E4M3_Traits, 
-    SafeConversionPolicy
-> {
-    using type = MOS6502_E5M2_to_E4M3_Conversion<
-        E5M2_Traits, 
-        E4M3_Traits, 
-        SafeConversionPolicy
-    >;
-};
-```
-
-**Benefits:**
-- FP8 ↔ FP8 conversions can use lookup tables (256 or 65K entries)
-- Platform-specific bit manipulation tricks
-- SIMD implementations for batch conversions
-- No changes to user code
-
-### Error Handling Mechanisms
-
-**Silent mode (default):**
-```cpp
-FP8 dst = fp32_src;  // Overflow → saturate to max, no error signal
-```
-
-**Exception mode:**
-```cpp
-try {
-    auto dst = src.convert_to<FP8_Traits, StrictConversionPolicy>();
-} catch (const ConversionException& e) {
-    // Handle overflow, underflow, NaN conversion, etc.
-}
-```
-
-**Status flag mode:**
-```cpp
-ConversionStatus::clear();
-FP8 dst = fp32_src;  // Uses policy with SetFlag mode
-
-if (ConversionStatus::get_error() != ConversionStatus::Error::None) {
-    // Handle error
-}
-```
-
-**Compile-time error mode:**
-```cpp
-// If source always has NaN and dest never does, and policy treats as error:
-struct NeverNaN_Traits {
-    using specials = SpecialValuePolicy<false, false, false, false>;
-};
-
-struct AlwaysNaN_Source {
-    using specials = SpecialValuePolicy<true, true, true, true>;
-};
-
-// This would fail at compile time with appropriate policy:
-// NeverNaN dst = always_nan_src;  // static_assert fires
-```
-
-### Conversion Testing
-
-Conversions must be tested as thoroughly as operations:
-
-**Exhaustive testing for FP8:**
-- All 256 values in source format
-- Convert to destination format
-- Verify against reference implementation
-- Test all policy combinations
-
-**Round-trip testing:**
-```cpp
-// FP32 → FP8 → FP32 should be "close"
-for (auto original : test_values) {
-    auto fp8 = convert<FP8_Traits>(original);
-    auto back = convert<FP32_Traits>(fp8);
-    assert(approximately_equal(original, back, tolerance));
-}
-```
-
-**Monotonicity testing:**
-```cpp
-// If a < b, then convert(a) ≤ convert(b)
-assert(convert(a) <= convert(b));
-```
-
-**Property testing:**
-- Conversion preserves sign (except for special cases)
-- Conversion preserves ordering (monotonicity)
-- Special values map correctly
-
-**Cross-validation:**
-- Generic implementation vs platform-optimized implementation
-- Different policy combinations produce expected different results
-
-### Conversion Matrix
-
-For N formats, need N² conversion functions. These are generated automatically:
-
-```cpp
-using AllFormats = std::tuple<
-    FP8_E4M3_Traits,
-    FP8_E5M2_Traits,
-    FP8_E4M3FNUZ_Traits,
-    FP8_E5M2FNUZ_Traits,
-    FP16_Traits,
-    BFloat16_Traits,
-    FP32_Traits,
-    FP64_Traits
->;
-
-// Generates 8×8 = 64 conversion functions
-// (including identity conversions which are no-ops)
-template<typename FormatList>
-struct GenerateAllConversions;
-```
-
-Each conversion function is instantiated on first use. Dead conversions eliminated by linker.
-
-### Real-World Use Cases
-
-**ML model quantization:**
-```cpp
-// Load FP32 training weights
-std::vector<FP32> training_weights = load_model();
-
-// Quantize to FP8 for inference
-std::vector<FP8_E4M3> inference_weights;
-for (auto w : training_weights) {
-    inference_weights.push_back(convert<FP8_E4M3_Traits>(w));
-}
-```
-
-**Format experimentation:**
-```cpp
-// Test different formats for a layer
-auto accuracy_e4m3 = benchmark_layer<FP8_E4M3>(data);
-auto accuracy_e5m2 = benchmark_layer<FP8_E5M2>(data);
-auto accuracy_e3m4 = benchmark_layer<FP8_E3M4>(data);
-
-// Pick best format
-using BestFormat = /* format with highest accuracy */;
-```
-
-**Mixed-precision inference:**
-```cpp
-// Some layers in FP8, some in FP16
-FP8_E4M3 conv_output = conv_layer_fp8(input);
-FP16 attention_output = attention_layer_fp16(
-    convert<FP16_Traits>(conv_output)
+// Generic conversion
+template<
+    typename DstTraits,
+    typename SrcTraits,
+    typename ConversionPolicy = SafeConversionPolicy
+>
+typename DstTraits::format::storage_type convert(
+    typename SrcTraits::format::storage_type src
 );
-FP8_E4M3 final = convert<FP8_E4M3_Traits>(attention_output);
+
+// Usage:
+FloatEngine<FP32_Traits> src_value = ...;
+auto dst_value = convert<FP8_E4M3_Traits>(src_value);
 ```
 
-### Format Compatibility Notes
+#### A.8 Microscaling Policy Examples
 
-**FNUZ variants (Finite Numbers, Unsigned Zero):**
-- No infinity: overflow saturates to max value
-- No negative zero: only one zero representation
-- Non-standard exponent bias
-- Requires special handling in conversions
-
-**Conversion examples:**
-```cpp
-// IEEE 754 → FNUZ: Inf becomes max value
-FP8_E4M3FNUZ dst = fp32_inf;  // → max representable value
-
-// FNUZ → IEEE 754: can add Inf if overflow
-FP32 dst = fp8_fnuz_max;  // → stays at max (no Inf unless overflow)
-
-// Signed zero → unsigned zero
-FP8_E4M3FNUZ dst = fp32_negative_zero;  // → positive zero
-```
-
-The conversion system handles these variants through policy configuration and format trait specifications.
-
-## 12. Microscaling (MX) Formats
-
-### The Microscaling Concept
-
-Microscaling (MX) is a compression technique that groups values into blocks with a shared scale factor. Instead of each value having its own exponent, a block of values shares a single exponent while maintaining individual mantissas.
-
-**Key insight:** Most tensor values in a local region have similar magnitudes. Sharing an exponent across a block saves bits while maintaining acceptable precision.
-
-**MX Format Structure:**
-- **Element type**: The data type for individual values (e.g., FP8 E4M3, FP6, INT8)
-- **Scale type**: The data type for the shared scale factor (typically E8M0)
-- **Block size**: Number of consecutive elements sharing one scale (typically 32)
-
-**Example: MXFP8 with E4M3 elements**
-- 32 FP8 E4M3 values: 32 × 8 = 256 bits
-- 1 shared E8M0 scale: 8 bits
-- Total: 264 bits for 32 values
-- Compared to individual E4M3: 32 × 8 = 256 bits (but worse dynamic range)
-- Compared to FP32: 32 × 32 = 1024 bits
-
-### MX Format Specification
-
-An MX-compliant format consists of:
-- Scale (X) data type / encoding (w bits)
-- Private elements (Pᵢ) data type / encoding (d bits each)
-- Scaling block size (k)
-
-Each block of k elements is encoded in (w + kd) bits.
-
-**Decoding values:**
-Given scale X and elements P₁, P₂, ..., Pₖ:
-
-- If X = NaN, then vᵢ = NaN for all i (entire block is NaN)
-- If X ≠ NaN:
-  - If Pᵢ ∈ {Inf, NaN}, then vᵢ = Pᵢ (element special values preserved)
-  - Otherwise, vᵢ = X × Pᵢ (scale times element value)
-
-If X × Pᵢ exceeds float32 range, behavior is implementation-defined (saturate, error, or Inf).
-
-### Standard MX Formats
-
-| Format Name | Element Type | Element Bits | Block Size | Scale Type | Scale Bits |
-|-------------|-------------|--------------|------------|------------|------------|
-| MXFP8 (E5M2) | FP8 E5M2 | 8 | 32 | E8M0 | 8 |
-| MXFP8 (E4M3) | FP8 E4M3 | 8 | 32 | E8M0 | 8 |
-| MXFP6 (E3M2) | FP6 E3M2 | 6 | 32 | E8M0 | 8 |
-| MXFP6 (E2M3) | FP6 E2M3 | 6 | 32 | E8M0 | 8 |
-| MXFP4 | FP4 E2M1 | 4 | 32 | E8M0 | 8 |
-| MXINT8 | INT8 | 8 | 32 | E8M0 | 8 |
-
-**Note:** MXFP8 has two variants (E5M2 and E4M3) which are considered different formats.
-
-### E8M0 Scale Format
-
-The E8M0 format represents pure powers of 2:
-- 8-bit exponent, 0-bit mantissa
-- No sign bit (scales are always positive powers of 2)
-- Value = 2^(exponent - bias), where bias = 127
-- Can represent scales from 2^-127 to 2^128
-
-```cpp
-struct E8M0_Traits {
-    using format = FormatPolicy<0, 8, 0>;  // No sign, 8-bit exp, no mantissa
-    static constexpr int exponent_bias = 127;
-};
-
-// E8M0 represents a power-of-2 scale factor
-float scale_value = std::pow(2.0f, exponent - 127);
-```
-
-### Microscaling Policy
-
-MX formats are defined by three parameters:
+**MX Format Definition:**
 
 ```cpp
 template<
-    typename ElementTraits,    // Type of individual elements
-    typename ScaleTraits,      // Type of shared scale factor
-    int BlockSize              // Elements per block
+    typename ElementTraits,
+    typename ScaleTraits,
+    int BlockSize
 >
 struct MicroscalingPolicy {
     using element_traits = ElementTraits;
     using scale_traits = ScaleTraits;
     static constexpr int block_size = BlockSize;
     
-    // Derived properties
     static constexpr int element_bits = ElementTraits::format::total_bits;
     static constexpr int scale_bits = ScaleTraits::format::total_bits;
     static constexpr int bits_per_block = scale_bits + (block_size * element_bits);
     
-    // Scale selection strategy
     enum class ScaleStrategy {
-        MaxAbsValue,     // Scale to fit largest absolute value
-        RMS,             // Root mean square
-        Percentile99     // 99th percentile (ignore outliers)
+        MaxAbsValue,
+        RMS,
+        Percentile99
     };
     static constexpr ScaleStrategy scale_strategy = ScaleStrategy::MaxAbsValue;
 };
-```
 
-**Standard format definitions:**
-
-```cpp
-// MXFP8 with E4M3 elements
+// MXFP8 E4M3 definition
 using MXFP8_E4M3 = MicroscalingPolicy<
     E4M3_Traits,
     E8M0_Traits,
     32
 >;
-
-// MXFP8 with E5M2 elements
-using MXFP8_E5M2 = MicroscalingPolicy<
-    E5M2_Traits,
-    E8M0_Traits,
-    32
->;
-
-// MXFP6 with E3M2 elements
-using MXFP6_E3M2 = MicroscalingPolicy<
-    E3M2_Traits,
-    E8M0_Traits,
-    32
->;
-
-// MXFP4
-using MXFP4 = MicroscalingPolicy<
-    E2M1_Traits,
-    E8M0_Traits,
-    32
->;
 ```
 
-### MX Tensor Container
-
-MX formats are storage/compression schemes, not numeric types. They are implemented as containers:
+**Microscaling Container Interface:**
 
 ```cpp
-template<typename MXPolicy>
-class MXTensor {
+template<typename MicroscalingPolicy>
+class MicroscaledArray {
 private:
     struct Block {
-        FloatEngine<typename MXPolicy::scale_traits> scale;
-        FloatEngine<typename MXPolicy::element_traits> 
-            elements[MXPolicy::block_size];
+        FloatEngine<typename MicroscalingPolicy::scale_traits> scale;
+        std::array<
+            FloatEngine<typename MicroscalingPolicy::element_traits>,
+            MicroscalingPolicy::block_size
+        > elements;
     };
     
     std::vector<Block> blocks_;
     size_t size_;
     
 public:
-    MXTensor(size_t size);
-    
-    // Access individual elements (decompresses on read)
-    float get(size_t index) const;
-    
-    // Set individual elements (may trigger re-quantization)
-    void set(size_t index, float value);
-    
-    // Batch operations
-    void set_block(size_t block_idx, std::span<const float> values);
-    std::span<const float> get_block(size_t block_idx) const;
-    
-    size_t size() const { return size_; }
-    size_t num_blocks() const { return blocks_.size(); }
-};
-```
-
-**Dequantization algorithm (get):**
-
-```cpp
-template<typename MXPolicy>
-float MXTensor<MXPolicy>::get(size_t index) const {
-    size_t block_idx = index / MXPolicy::block_size;
-    size_t elem_idx = index % MXPolicy::block_size;
-    
-    auto& block = blocks_[block_idx];
-    
-    // Handle NaN scale: entire block is NaN
-    if (block.scale.is_nan()) {
-        return std::numeric_limits<float>::quiet_NaN();
+    MicroscaledArray(size_t size) : size_(size) {
+        blocks_.resize((size + MicroscalingPolicy::block_size - 1) / 
+                       MicroscalingPolicy::block_size);
     }
     
-    auto elem = block.elements[elem_idx];
-    
-    // Preserve element special values
-    if (elem.is_inf() || elem.is_nan()) {
-        return elem.to_float();
+    // Dequantize: scale × element
+    float get(size_t index) const {
+        size_t block_idx = index / MicroscalingPolicy::block_size;
+        size_t elem_idx = index % MicroscalingPolicy::block_size;
+        
+        auto& block = blocks_[block_idx];
+        
+        if (block.scale.is_nan()) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        
+        auto elem = block.elements[elem_idx];
+        
+        if (elem.is_special()) {
+            return elem.to_float();
+        }
+        
+        return block.scale.to_float() * elem.to_float();
     }
     
-    // Compute v_i = X × P_i
-    float scale_value = std::pow(2.0f, block.scale.exponent() - 127);
-    float elem_value = elem.to_float();
-    float result = scale_value * elem_value;
-    
-    // Handle overflow (implementation-defined)
-    if (std::abs(result) > std::numeric_limits<float>::max()) {
-        return std::copysign(std::numeric_limits<float>::max(), result);
-    }
-    
-    return result;
-}
-```
-
-**Quantization algorithm (set_block):**
-
-```cpp
-template<typename MXPolicy>
-void MXTensor<MXPolicy>::set_block(
-    size_t block_idx, 
-    std::span<const float> values
-) {
-    // Step 1: Find optimal scale for block
-    float max_abs = 0.0f;
-    for (float v : values) {
-        if (std::isfinite(v)) {
+    // Quantize block from float array
+    void set_block(size_t block_idx, std::span<const float> values) {
+        assert(values.size() == MicroscalingPolicy::block_size);
+        
+        // Find scale factor based on policy strategy
+        float max_abs = 0.0f;
+        for (float v : values) {
             max_abs = std::max(max_abs, std::abs(v));
         }
-    }
-    
-    // Step 2: Determine scale as power of 2
-    // Scale chosen so max value fits in element range
-    using ElemTraits = typename MXPolicy::element_traits;
-    constexpr float elem_max = /* max representable in element type */;
-    
-    int scale_exp = std::ceil(std::log2(max_abs / elem_max)) + 127;
-    scale_exp = std::clamp(scale_exp, 0, 255);
-    
-    blocks_[block_idx].scale = 
-        FloatEngine<typename MXPolicy::scale_traits>::from_bits(scale_exp);
-    
-    // Step 3: Quantize each element
-    float scale_value = std::pow(2.0f, scale_exp - 127);
-    
-    for (size_t i = 0; i < values.size(); i++) {
-        float scaled = values[i] / scale_value;
-        blocks_[block_idx].elements[i] = 
-            convert<ElemTraits>(scaled);
-    }
-}
-```
-
-### Quantization and Dequantization Functions
-
-```cpp
-// Quantize float array to MX format
-template<typename MXPolicy, typename QuantPolicy = DefaultQuantPolicy>
-MXTensor<MXPolicy> quantize(std::span<const float> values) {
-    MXTensor<MXPolicy> result(values.size());
-    
-    size_t num_blocks = (values.size() + MXPolicy::block_size - 1) 
-                       / MXPolicy::block_size;
-    
-    for (size_t b = 0; b < num_blocks; b++) {
-        size_t start = b * MXPolicy::block_size;
-        size_t end = std::min(start + MXPolicy::block_size, values.size());
         
-        result.set_block(b, values.subspan(start, end - start));
-    }
-    
-    return result;
-}
-
-// Dequantize MX format to float array
-template<typename MXPolicy>
-std::vector<float> dequantize(const MXTensor<MXPolicy>& tensor) {
-    std::vector<float> result(tensor.size());
-    
-    for (size_t i = 0; i < tensor.size(); i++) {
-        result[i] = tensor.get(i);
-    }
-    
-    return result;
-}
-
-// Convert between MX formats
-template<typename DstMXPolicy, typename SrcMXPolicy>
-MXTensor<DstMXPolicy> convert_mx(const MXTensor<SrcMXPolicy>& src) {
-    // Dequantize to float, re-quantize to new format
-    auto float_values = dequantize(src);
-    return quantize<DstMXPolicy>(float_values);
-}
-```
-
-### Real-World Use Cases
-
-**ML Model Quantization:**
-
-```cpp
-// Training weights in FP32
-std::vector<float> training_weights = load_model();
-
-// Quantize to MXFP8 for inference
-MXTensor<MXFP8_E4M3> inference_weights = quantize<MXFP8_E4M3>(training_weights);
-
-// Later: dequantize for computation
-auto weights_fp32 = dequantize(inference_weights);
-```
-
-**Mixed Precision Storage:**
-
-```cpp
-// Store activations in MXFP6, weights in MXFP8
-MXTensor<MXFP6_E3M2> activations = quantize<MXFP6_E3M2>(activation_data);
-MXTensor<MXFP8_E4M3> weights = quantize<MXFP8_E4M3>(weight_data);
-
-// Compute in FP16 or FP32
-auto act_fp32 = dequantize(activations);
-auto wgt_fp32 = dequantize(weights);
-// ... perform computation ...
-```
-
-**Format Experimentation:**
-
-```cpp
-// Test different MX formats for a layer
-auto loss_e4m3 = evaluate_layer(quantize<MXFP8_E4M3>(weights));
-auto loss_e5m2 = evaluate_layer(quantize<MXFP8_E5M2>(weights));
-auto loss_fp6  = evaluate_layer(quantize<MXFP6_E3M2>(weights));
-
-// Choose format with best accuracy
-```
-
-### Advantages of MX Formats
-
-**Improved dynamic range:**
-- FP8 with per-tensor scale: all values must fit in FP8 range
-- MXFP8 with per-block scale: each block can use different scale
-- Allows E4M3 (better precision) instead of E5M2 (better range)
-
-**Compression efficiency:**
-- Better than per-tensor quantization (more scales)
-- Less overhead than per-element full floats
-- Sweet spot for tensor data with local magnitude similarity
-
-**Hardware efficiency:**
-- Shared exponent simplifies hardware
-- NVIDIA H100 has native MXFP8 support
-- Vectorized operations benefit from uniform block structure
-
-### Integration with Library
-
-MX formats leverage existing infrastructure:
-
-**Element types use existing FloatEngine:**
-- E4M3, E5M2, E3M2, E2M1 are already supported
-- No new float operations needed
-
-**Scale type is just another format:**
-- E8M0 is a valid (if unusual) float format
-- Uses same FormatPolicy structure
-
-**Conversion system handles quantization:**
-- Quantization uses existing convert<> infrastructure
-- Scale finding is the only new logic
-
-**Testing applies:**
-- Round-trip testing: float → MX → float
-- Block-level exhaustive testing for small formats
-- Property testing: monotonicity, scale correctness
-
-### Custom MX Formats
-
-Users can define custom MX formats using the policy system:
-
-```cpp
-// Custom: 16-bit elements, 64 per block
-using CustomMX = MicroscalingPolicy<
-    FP16_Traits,    // 16-bit elements
-    E8M0_Traits,    // Standard scale
-    64              // Larger blocks
->;
-
-// Custom: 4-bit elements, smaller blocks
-using TinyMX = MicroscalingPolicy<
-    FP4_E2M1_Traits,
-    E8M0_Traits,
-    16              // Smaller blocks for better adaptation
->;
-
-// Use like standard formats
-MXTensor<CustomMX> my_tensor = quantize<CustomMX>(data);
-```
-
-The microscaling policy system provides production-ready support for NVIDIA's MX formats while maintaining flexibility for experimentation and custom formats.
-
-## 13. Testing and Validation
-
-### The Testing Challenge
-
-A policy-based float library presents unique testing challenges:
-
-- **Format variations**: FP8 E5M2, E4M3, FP16, FP32, custom formats
-- **Policy combinations**: Rounding modes, special values, guard bits, error handling
-- **Platform implementations**: C++ reference vs assembly vs ROM routines
-- **Semantic variations**: IEEE compliant vs fast-and-wrong configurations
-
-Testing every permutation manually is infeasible. The solution combines exhaustive testing for small formats with automated policy enumeration.
-
-### Testing as a Policy Dimension
-
-Testing strategy is itself a policy that varies by format:
-
-```cpp
-enum class TestStrategy {
-    Exhaustive,        // Test all possible input combinations
-    EdgePlusSampling,  // Boundary cases + random sampling
-    PropertyBased,     // Algebraic properties only
-    Targeted,          // Hand-picked difficult cases
-    None               // No automated tests
-};
-
-template<TestStrategy Strategy, size_t SampleCount = 10000>
-struct TestingPolicy {
-    static constexpr TestStrategy strategy = Strategy;
-    static constexpr size_t sample_count = SampleCount;
-    
-    // Edge case coverage
-    static constexpr bool test_zero = true;
-    static constexpr bool test_inf = true;
-    static constexpr bool test_nan = true;
-    static constexpr bool test_denormals = true;
-    static constexpr bool test_powers_of_two = true;
-    static constexpr bool test_near_one = true;
-    
-    // Sampling strategy
-    static constexpr bool uniform_sampling = true;
-    static constexpr bool logarithmic_sampling = false;
-};
-
-// Format size determines feasible test strategy
-template<typename Format>
-struct DefaultTestingPolicy {
-    static constexpr TestStrategy strategy = 
-        (Format::total_bits <= 8)  ? TestStrategy::Exhaustive :
-        (Format::total_bits <= 16) ? TestStrategy::EdgePlusSampling :
-                                     TestStrategy::Targeted;
-    
-    static constexpr size_t sample_count = 
-        (Format::total_bits <= 16) ? 1000000 :  // 1M samples for FP16
-        (Format::total_bits <= 32) ? 100000 :   // 100K for FP32
-                                     10000;     // 10K for FP64
-};
-```
-
-Testing policy is included in trait bundles:
-
-```cpp
-struct IEEE754_Binary32_Traits {
-    using format = FormatPolicy<1, 8, 23>;
-    using rounding = RoundingPolicy<ToNearest>;
-    // ... other policies
-    
-    using testing = TestingPolicy<
-        TestStrategy::EdgePlusSampling,
-        100000
-    >;
-};
-```
-
-### Exhaustive Testing for Small Formats
-
-**Key insight**: FP8 and FP16 formats have small enough value spaces to test exhaustively.
-
-**FP8 formats (E5M2, E4M3):**
-- 256 possible values
-- 256 × 256 = 65,536 input pairs per binary operation
-- All operations (add, sub, mul, div) = ~260,000 total tests
-- Runs in seconds on modern hardware
-- **Provides mathematical proof of correctness**
-
-**FP16 (binary16):**
-- 65,536 possible values
-- 4.3 billion input pairs per operation
-- Takes hours but is feasible
-- Can parallelize across CPU cores
-
-**Exhaustive test implementation:**
-
-```cpp
-template<typename Traits>
-void test_exhaustive_fp8() {
-    using Float = FloatEngine<Traits>;
-    using storage_type = typename Traits::format::storage_type;
-    
-    size_t failures = 0;
-    
-    // Test every possible input combination
-    for (uint16_t a_bits = 0; a_bits < 256; a_bits++) {
-        for (uint16_t b_bits = 0; b_bits < 256; b_bits++) {
-            auto a = static_cast<storage_type>(a_bits);
-            auto b = static_cast<storage_type>(b_bits);
-            
-            // Test multiplication
-            auto result = Float::mul(a, b);
-            auto expected = reference_mul<Traits>(a, b);
-            
-            if (result != expected) {
-                log_failure("mul", a, b, result, expected);
-                failures++;
-            }
-            
-            // Test addition
-            result = Float::add(a, b);
-            expected = reference_add<Traits>(a, b);
-            
-            if (result != expected) {
-                log_failure("add", a, b, result, expected);
-                failures++;
-            }
-            
-            // ... test other operations
+        // Convert to scale format (e.g., E8M0)
+        blocks_[block_idx].scale = /* compute scale from max_abs */;
+        
+        // Quantize elements
+        for (size_t i = 0; i < values.size(); ++i) {
+            blocks_[block_idx].elements[i] = 
+                convert<typename MicroscalingPolicy::element_traits>(
+                    values[i] / blocks_[block_idx].scale.to_float()
+                );
         }
     }
-    
-    if (failures == 0) {
-        std::cout << "PASS: All " << (256*256) << " cases correct\n";
-    } else {
-        std::cout << "FAIL: " << failures << " incorrect results\n";
-    }
-}
-```
-
-**What exhaustive testing proves:**
-
-If exhaustive testing passes for a given trait configuration:
-- The implementation is mathematically correct for those policies
-- No edge cases or corner cases remain untested
-- The code can be trusted for production use
-
-This is much stronger than statistical sampling or random testing.
-
-### Test Execution Based on Policy
-
-The test framework uses the testing policy to select appropriate strategy:
-
-```cpp
-template<typename Traits>
-void run_tests() {
-    if constexpr (Traits::testing::strategy == TestStrategy::Exhaustive) {
-        test_exhaustive<Traits>();
-        
-    } else if constexpr (Traits::testing::strategy == TestStrategy::EdgePlusSampling) {
-        test_edge_cases<Traits>();
-        test_random_samples<Traits>(Traits::testing::sample_count);
-        
-    } else if constexpr (Traits::testing::strategy == TestStrategy::PropertyBased) {
-        test_commutativity<Traits>();
-        test_associativity<Traits>();
-        test_identity<Traits>();
-        
-    } else if constexpr (Traits::testing::strategy == TestStrategy::Targeted) {
-        test_boundary_values<Traits>();
-        test_powers_of_two<Traits>();
-        test_difficult_cases<Traits>();
-    }
-    
-    // Property tests always run as sanity checks
-    if constexpr (Traits::testing::strategy != TestStrategy::None) {
-        verify_basic_properties<Traits>();
-    }
-}
-```
-
-### Compile-Time Policy Enumeration
-
-For larger formats, test representative policy combinations by generating all valid configurations at compile time.
-
-**Cartesian product of policy lists:**
-
-```cpp
-// Define policy dimensions
-using AllFormats = std::tuple<
-    FormatPolicy<1, 5, 2>,   // FP8 E5M2
-    FormatPolicy<1, 4, 3>,   // FP8 E4M3
-    FormatPolicy<1, 5, 10>,  // FP16
-    FormatPolicy<1, 8, 23>   // FP32
->;
-
-using AllRoundingModes = std::tuple<
-    RoundingPolicy<RoundingMode::ToNearest>,
-    RoundingPolicy<RoundingMode::TowardZero>
->;
-
-using AllSpecialValues = std::tuple<
-    SpecialValuePolicy<false, false, false, false>,  // No specials
-    SpecialValuePolicy<false, true, false, false>,   // Infinity only
-    SpecialValuePolicy<true, true, true, true>       // Full IEEE 754
->;
-
-using AllGuardBits = std::tuple<
-    GuardBitsPolicy<0>,
-    GuardBitsPolicy<3>,
-    GuardBitsPolicy<8>
->;
-
-// Cartesian product: all combinations
-using AllCombinations = CartesianProduct<
-    AllFormats,
-    AllRoundingModes,
-    AllSpecialValues,
-    AllGuardBits
-    // ... more policy dimensions
->;
-// Results in: 4 × 2 × 3 × 3 = 72 configurations
-```
-
-**The `CartesianProduct` template** can be implemented in ~50-100 lines of template metaprogramming, or use Boost.MP11's `mp_product`. The technique is proven and works in standard C++.
-
-**Filter invalid combinations:**
-
-```cpp
-// Check if a trait bundle is valid
-template<typename Traits>
-struct IsValidConfiguration {
-    static constexpr bool value = 
-        // Rounding constraint
-        (!Traits::rounding::needs_rounding || 
-         Traits::guard_bits::guard_bits > 0) &&
-        
-        // Denormal constraint  
-        (!Traits::specials::has_denormals || 
-         Traits::normalization::normalize_on_pack) &&
-        
-        // Add more constraint checks
-        true;
 };
-
-// Filter to only valid configurations
-template<typename ConfigList>
-using FilterValid = /* filter using IsValidConfiguration */;
-
-using ValidConfigurations = FilterValid<AllCombinations>;
 ```
 
-**Compile-time test instantiation:**
+#### A.9 Compile-Time Validation
+
+**Policy Constraint Checking:**
 
 ```cpp
-// Iterate over all valid configurations at compile time
-template<typename Tuple, typename Func, size_t... Is>
-void for_each_type_impl(Func&& f, std::index_sequence<Is...>) {
-    // C++17 fold expression: call f for each type
-    (f.template operator()<std::tuple_element_t<Is, Tuple>>(), ...);
-}
-
-template<typename Tuple, typename Func>
-void for_each_type(Func&& f) {
-    for_each_type_impl<Tuple>(
-        std::forward<Func>(f), 
-        std::make_index_sequence<std::tuple_size_v<Tuple>>{}
+template<typename Traits>
+struct ValidateTraits {
+    using Format = typename Traits::format;
+    using Rounding = typename Traits::rounding;
+    using GuardBits = typename Traits::guard_bits;
+    using Specials = typename Traits::specials;
+    using Normalization = typename Traits::normalization;
+    
+    // Rounding modes other than TowardZero require guard bits
+    static_assert(
+        !Rounding::needs_guard_bits || GuardBits::guard_bits > 0,
+        "Rounding modes other than TowardZero require guard bits > 0"
     );
-}
-
-// Test runner
-template<typename ValidConfigs>
-struct TestRunner {
-    static void run_all() {
-        for_each_type<ValidConfigs>([]<typename Config>() {
-            // Instantiate test for this configuration
-            test_configuration<Config>();
-        });
-    }
+    
+    // Denormal support requires normalization
+    static_assert(
+        !Specials::has_denormals || Normalization::normalize_on_pack,
+        "Denormal support requires normalization on pack"
+    );
+    
+    // Sign must be exactly 1 bit
+    static_assert(
+        Format::sign_bits == 1,
+        "Sign must be exactly 1 bit"
+    );
+    
+    // Reasonable exponent range
+    static_assert(
+        Format::exponent_bits >= 2 && Format::exponent_bits <= 15,
+        "Exponent must be between 2 and 15 bits"
+    );
+    
+    // Reasonable mantissa range
+    static_assert(
+        Format::mantissa_bits >= 1 && Format::mantissa_bits <= 112,
+        "Mantissa must be between 1 and 112 bits"
+    );
+    
+    // Total size reasonable
+    static_assert(
+        Format::total_bits <= 128,
+        "Total format size must not exceed 128 bits"
+    );
 };
 
-// Usage
-int main() {
-    TestRunner<ValidConfigurations>::run_all();
-    // Compiler instantiates test for EVERY valid configuration
-    // Runtime executes them all
-}
+// Instantiating FloatEngine triggers validation
+template<typename Traits>
+class FloatEngine {
+    ValidateTraits<Traits> _validate;  // Triggers static_asserts
+    // ...
+};
 ```
 
-**Benefits:**
-
-- All valid configurations tested automatically
-- Invalid configurations fail at compile time (can't accidentally test broken configs)
-- Adding a new policy dimension automatically tests all combinations
-- No manual test case maintenance
-
-**Cost:**
-
-- Compilation time increases (72 configs × test code per config)
-- Binary size increases (each config instantiates ~10KB of test code)
-- For test suites, this is acceptable
-
-### Testing Strategy Summary
-
-**Tier 1: Exhaustive (FP8 formats)**
-- Test every possible input combination
-- Provides mathematical proof of correctness
-- Required for all FP8 trait configurations
-
-**Tier 2: Extensive sampling (FP16)**
-- Exhaustive testing feasible but slow
-- Optional: run overnight or on CI server
-- Provides very high confidence
-
-**Tier 3: Targeted testing (FP32, FP64)**
-- Boundary values (zero, min, max, inf, nan)
-- Powers of 2
-- Values near 1.0
-- Difficult cases (Kahan summation edge cases)
-- Random sampling (10,000-100,000 cases)
-
-**Tier 4: Cross-validation**
-- Fast config tested against accurate config
-- Accurate config tested against IEEE config  
-- Platform assembly tested against C++ reference
-- Each tier builds confidence in the next
-
-**Tier 5: Property testing**
-- Commutativity: a + b == b + a
-- Associativity: (a + b) + c ≈ a + (b + c) within tolerance
-- Identity: a + 0 == a, a × 1 == a, a × 0 == 0
-- Monotonicity: if a < b and c > 0, then a×c < b×c
-- Sign preservation: sign(a × b) == sign(a) × sign(b)
-
-Properties hold regardless of precision or rounding mode (within tolerance).
-
-### Reference Implementations
-
-Each test needs a reference implementation to compare against:
-
-**For IEEE-compliant configurations:**
-- Compare against language built-in float/double (if same format)
-- Compare against MPFR (arbitrary precision library)
-- Compare against SoftFloat (Berkeley software float)
-
-**For non-IEEE configurations:**
-- C++ template implementation serves as reference
-- Higher precision configuration serves as reference (FP8 → FP16 → FP32)
-- Mathematically computed expected values for simple cases
-
-**For platform-specific implementations:**
-- Assembly version tested against C++ reference
-- Both should produce identical bit patterns for same traits
-
-### Continuous Integration
-
-Recommended CI pipeline:
-
-```yaml
-# .github/workflows/test.yml (example)
-- name: Exhaustive FP8 tests
-  run: |
-    ./run_tests --exhaustive --format=fp8
-    # ~260K tests, runs in seconds
-
-- name: Extensive FP16 tests  
-  run: |
-    ./run_tests --extensive --format=fp16
-    # Billions of tests, runs for hours
-  # Only on nightly builds or release branches
-
-- name: Policy enumeration tests
-  run: |
-    ./run_tests --all-configs --format=fp32
-    # All valid policy combinations
-
-- name: Platform validation
-  run: |
-    ./run_tests --platform=mos6502 --validate-asm
-    # Compare assembly against C++ reference
-```
-
-### Test Organization
-
-Tests are automatically generated from policy combinations:
-
-```
-tests/
-  generated_tests.cpp       # All trait combinations generated via CartesianProduct
-  reference/
-    mpfr_reference.cpp      # High-precision reference for validation
-    softfloat_reference.cpp # IEEE 754 software reference
-  platform/
-    validate_asm.cpp        # Platform-specific implementation validation
-  properties/
-    arithmetic_laws.cpp     # Algebraic property tests (always run)
-```
-
-Each trait configuration includes its testing policy, so the test framework automatically:
-- Uses exhaustive testing for FP8 formats
-- Uses edge-plus-sampling for FP16
-- Uses targeted testing for FP32 and larger
-- Validates platform implementations against C++ reference
-
-No manual test file creation needed - everything is generated from the Cartesian product of policies.
-
-### Validation Confidence Levels
-
-After running the full test suite:
-
-**FP8 formats with exhaustive testing:**
-- Confidence: Mathematical proof
-- Can be used in production without reservation
-
-**FP16 with extensive testing:**  
-- Confidence: Extremely high (billions of test cases)
-- Suitable for production use
-
-**FP32 with targeted testing:**
-- Confidence: High (boundary cases + sampling + properties)
-- Suitable for production with standard validation practices
-
-**Platform-specific implementations:**
-- Confidence: Depends on coverage
-- Assembly must match C++ reference bit-for-bit
-- Any mismatch is a bug in assembly or calling convention
-
-The combination of exhaustive testing (where feasible), automated policy enumeration, and cross-validation provides strong confidence in library correctness across the entire policy space.
-
-## 14. Future Work
-
-### Transcendental Functions
-
-Functions like sin, cos, log, exp require:
-- Range reduction algorithms
-- Polynomial approximations or CORDIC
-- Accuracy vs performance tradeoffs
-- Table-driven vs computed approaches
-
-Policy dimensions needed:
-- Accuracy target (ulp error bound)
-- Range reduction strategy
-- Approximation method
-- Table size limits
-
-### Fixed-Point Types
-
-Apply same policy-based design to fixed-point arithmetic:
-- Integer bits and fractional bits (configurable)
-- Rounding modes
-- Overflow handling (saturate, wrap, error)
-- Similar trait bundles
-
-Potential for unified numeric library covering float and fixed.
-
-### Format Conversions
-
-Converting between formats:
-- Widening (FP8 → Binary32)
-- Narrowing (Binary32 → FP8)
-- Same width different encoding (Binary32 → bfloat16)
-
-Issues:
-- Rounding modes during conversion
-- Special value mapping
-- Precision loss handling
-
-### SIMD Operations
-
-Where hardware supports it:
-- Vectorized operations (4x float32, 8x float16, etc.)
-- Platform-specific intrinsics
-- Alignment requirements
-- Fallback to scalar
-
-Would require additional policy dimension for vector width.
-
-## Appendices
-
-### A. Policy Reference
-
-**Number System Structure**
-
-- `FormatPolicy<S, E, M>`: Bit allocation (sign, exponent, mantissa)
-- `ExponentBiasPolicy<B>`: Bias value (-1 for standard, or explicit value)
-- `ImplicitBitPolicy<bool>`: Hidden leading bit
-- `SignRepresentationPolicy<Mode>`: Sign bit vs two's complement
-
-**Special Values**
-
-- `SpecialValuePolicy<NaN, Inf, SignedZero, Denormals>`: Which specials exist
-- `SpecialHandlingPolicy<Mode>`: How to handle specials (propagate, flush, error)
-- `DenormalHandlingPolicy<Mode>`: FTZ, FIZ, FOZ, full support, or none
-
-**Arithmetic**
-
-- `RoundingPolicy<Mode>`: ToNearest, TowardZero, TowardPositive, TowardNegative
-- `GuardBitsPolicy<N>`: Number of extra precision bits (0, 3, 8, 16, ...)
-- `NormalizationPolicy<When>`: Always, lazy, never
-
-**Error Management**
-
-- `ErrorDetectionPolicy<Flags>`: Which errors to detect
-- `ErrorReportingPolicy<Mechanism>`: None, errno, exceptions, local flags, global flags
-- `ErrorPropagationPolicy<Mode>`: How errors flow through calculations
-
-**Storage**
-
-- `StorageLayoutPolicy<Order, Packing, Endian>`: Physical memory layout
-- `FieldOrderPolicy<Order>`: SignExpMant, MantExpSign, etc.
-- `PackingPolicy<Mode>`: Tight, byte-aligned, native
-
-**Platform**
-
-- `HardwareCapabilitiesPolicy<Features>`: Multiply, divide, shifter, CLZ, SIMD
-- `CodeGenHintsPolicy<Hints>`: Integer width preference, type strategy, unroll hints
-- `CallingConventionPolicy<Conv>`: Register usage, stack layout
-
-**Operations**
-
-- `OperationSetPolicy<Ops>`: Which operations are available
-- `ImplementationPolicy<Ops>`: Where implementations come from
-
-**Testing**
-
-- `TestingPolicy<Strategy, SampleCount>`: Testing approach and coverage
-- `TestStrategy`: Exhaustive, EdgePlusSampling, PropertyBased, Targeted, None
-- Default strategy automatically selected based on format size
-
-**Conversion**
-
-- `ConversionPolicy`: Bundle of conversion-specific policies
-- `RangePolicy<Overflow, Underflow>`: Overflow/underflow handling
-- `SpecialMappingPolicy<NaN, Inf, Denormal>`: Special value mapping
-- `PrecisionPolicy<Rounding, GuardBits>`: Mantissa conversion precision
-- `ConversionErrorPolicy<Mode>`: Error detection and reporting
-- Preset bundles: SafeConversionPolicy, StrictConversionPolicy, FastConversionPolicy, MLInferenceConversionPolicy
-
-**Microscaling**
-
-- `MicroscalingPolicy<ElementTraits, ScaleTraits, BlockSize>`: MX format definition
-- Element type: The numeric format for individual values (E4M3, E5M2, E3M2, E2M1, INT8, etc.)
-- Scale type: Usually E8M0 (pure power-of-2 exponent)
-- Block size: Typically 32 elements
-- Standard formats: MXFP8_E4M3, MXFP8_E5M2, MXFP6_E3M2, MXFP6_E2M3, MXFP4, MXINT8
-- Container: MXTensor<MXPolicy> for compressed storage
-- Operations: quantize<MXPolicy>(), dequantize(), convert_mx()
-
-### B. Policy Interactions
-
-**Required Interactions:**
-
-- Rounding mode != TowardZero → guard_bits > 0
-- has_denormals = true → normalization handles denormals
-- has_nan = true → exponent interpretation includes all-1s encoding
-- error_reporting != None → error_detection must be enabled
-
-**Optional Interactions:**
-
-- Hardware multiply = false → prefer smaller guard byte over bits
-- Platform prefer 8-bit → prefer formats ≤ 32 bits total
-- Operation includes sqrt → may want extra guard bits
+### B. Policy Interactions and Constraints
+
+**Required interactions:**
+- Rounding mode other than TowardZero → GuardBits > 0
+- Denormal support → Normalization handles denormals
+- NaN support → Exponent interpretation includes all-1s
+- Error reporting enabled → Error detection enabled
+
+**Platform constraints:**
+- Format total_bits > 32 on byte-oriented platforms → warning
+- Hardware multiply = false → Consider lookup tables or iterative
+- SIMD available → Consider vectorized implementations
 
 **Validation:**
-
-All interactions checked at compile time with `static_assert`. Invalid combinations produce clear error messages.
+All constraints checked at compile time. Invalid combinations produce static_assert failures with explanatory messages.
 
 ### C. Platform Notes
 
-**MOS 6502**
-
-- 8-bit accumulator, 8-bit X/Y index registers
-- No hardware multiply or divide
-- 256 bytes zero page (fast access)
-- LLVM-MOS uses zero page for "imaginary registers" rc0-rc31
-- Calling convention: first 32 bits in rc0-rc3
-- Multiplication: 200-300 cycles in software
+**MOS 6502:**
+- 8-bit accumulator, X/Y index registers
+- No hardware multiply or divide (200-300 cycles in software)
+- 256-byte zero page (fast access)
+- LLVM-MOS uses zero page as "imaginary registers" rc0-rc31
 - Prefer: byte operations, lookup tables, guard byte not bits
 
-**ARM Cortex-M**
-
+**ARM Cortex-M:**
 - M0/M0+: No hardware divide, 1-cycle multiply
-- M3/M4: Hardware divide, 1-cycle multiply, optional FPU
+- M3/M4: Hardware divide, optional single-precision FPU
 - M7: Hardware FPU with double precision
-- Thumb-2 instruction set
-- AAPCS calling convention
-- Prefer: 32-bit operations, hardware multiply when available
+- Thumb-2 instruction set, efficient 32-bit operations
+- Prefer: 32-bit operations when multiply available
 
-**x86-64**
+**x86-64:**
+- Native 64-bit, hardware FPU with 80-bit internal precision
+- SSE/AVX for SIMD (4-8 floats in parallel)
+- Very fast multiply, divide, sqrt
+- Large caches favor computation over lookup tables
+- Prefer: wide operations, aggressive inlining, SIMD
 
-- 64-bit registers
-- Hardware FPU with 80-bit internal precision
-- SSE/AVX for SIMD
-- SysV ABI (Linux) or Microsoft ABI (Windows)
-- Prefer: wide operations, aggressive inlining, avoid lookup tables
+**RISC-V:**
+- 32-bit (RV32) or 64-bit (RV64) base integer
+- Optional multiply/divide (M extension)
+- Optional single/double precision FPU (F/D extensions)
+- Simple calling convention, good code density
+- Highly configurable, policy choices depend on extensions
 
-**RISC-V**
+### D. Format Catalog
 
-- 32-bit (RV32) or 64-bit (RV64) base
-- Optional multiply/divide extension (M)
-- Optional single-precision (F) or double-precision (D) FPU
-- Simple calling convention: a0-a7 for args, a0-a1 for return
-- Prefer: depends on extensions available
+**IEEE 754 Standard Formats:**
+- Binary16 (half): 1 + 5 + 10, range ±65504
+- Binary32 (single): 1 + 8 + 23, range ±3.4×10³⁸
+- Binary64 (double): 1 + 11 + 52, range ±1.8×10³⁰⁸
 
-**AVR**
+**ML Formats:**
+- FP8 E5M2: 1 + 5 + 2, wide range, low precision
+- FP8 E4M3: 1 + 4 + 3, better precision, narrower range
+- FP8 E4M3FNUZ: Finite numbers, unsigned zero variant
+- FP8 E5M2FNUZ: Finite numbers, unsigned zero variant
+- BFloat16: 1 + 8 + 7, matches FP32 range with less precision
+- FP6 E3M2 / E2M3: 6-bit formats for extreme compression
+- FP4 E2M1: 4-bit format for ultra-low precision
 
-- 8-bit architecture
-- No multiply on basic AVR, available on AVR-Enhanced
-- 32 general-purpose registers
-- Harvard architecture (separate code/data)
-- Calling convention: r25-r8 for args
-- Prefer: byte operations, code size critical
+**Historical Formats:**
+- Wozniak (Apple II): 1 + 8 + 23 with non-standard encoding
+- Microsoft Binary Format: Used in GW-BASIC, QuickBASIC
+- Cray formats: 64-bit with varying exponent sizes
+
+**Microscaling Formats:**
+- MXFP8 (E4M3 or E5M2): 32 elements, 8-bit E8M0 scale
+- MXFP6 (E3M2 or E2M3): 32 elements, 8-bit E8M0 scale
+- MXFP4: 32 elements, 8-bit E8M0 scale
+- MXINT8: 32 8-bit integers, 8-bit E8M0 scale
+
+All formats supported through policy configuration. Custom formats created by specifying bit allocations and policies.
