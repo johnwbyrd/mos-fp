@@ -1,4 +1,4 @@
-# Policy-Based Floating Point Library Design
+# Optimized Policy-Instantiated Numeric Engine (OPINE)
 
 ## Part I: Introduction and Motivation
 
