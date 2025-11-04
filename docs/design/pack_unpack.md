@@ -38,9 +38,9 @@ template<int ExpBits, int MantBits, typename TypePolicy = DefaultTypeSelectionPo
 using IEEE_Format = FormatDescriptor<...>;
 
 // Predefined formats
-using FP8_E5M2 = IEEE_Format<5, 2>;
-using FP8_E4M3 = IEEE_Format<4, 3>;
-using Binary32 = IEEE_Format<8, 23>;
+using fp8_e5m2 = IEEE_Format<5, 2>;
+using fp8_e4m3 = IEEE_Format<4, 3>;
+using fp32_e8m23 = IEEE_Format<8, 23>;
 ```
 
 ### 2. Rounding Policies (`policies/rounding.hpp`)
@@ -120,7 +120,7 @@ constexpr UnpackedFloat<Format, RoundingPolicy> unpack(
 5. Shift mantissa left by `guard_bits` positions (guard bits become LSBs, initialized to zero)
 6. Return UnpackedFloat
 
-**Example** (FP8 E5M2, TowardZero rounding):
+**Example** (fp8_e5m2, TowardZero rounding):
 ```
 Storage:  [S:1][E:5][M:2] = 8 bits
 Unpacked: sign=bool, exponent=uint_t<5>, mantissa=uint_t<3>
@@ -202,8 +202,8 @@ This will be implemented as part of adding proper rounding modes.
 ### Exhaustive Testing for Small Formats
 
 All FP8 formats (8 bits = 256 values) are tested exhaustively:
-- FP8 E5M2: All 256 values
-- FP8 E4M3: All 256 values
+- fp8_e5m2: All 256 values
+- fp8_e4m3: All 256 values
 - Padded 12-bit format: All 4096 values
 
 **Test**: `pack(unpack(x))` preserves significant bits (ignoring padding)
@@ -272,8 +272,8 @@ When rounding causes mantissa overflow:
 
 using namespace opine;
 
-// FP8 E5M2 format
-using Format = FP8_E5M2;
+// fp8_e5m2 format
+using Format = fp8_e5m2;
 
 // Pack a value
 Format::storage_type bits = 0b10110011;  // S=1, E=12, M=3
@@ -315,10 +315,10 @@ auto repacked = pack<PaddedFormat>(unpacked);
 
 ```cpp
 // (Once implemented)
-auto unpacked = unpack<FP8_E5M2, rounding_policies::ToNearestTiesToEven>(bits);
+auto unpacked = unpack<fp8_e5m2, rounding_policies::ToNearestTiesToEven>(bits);
 // unpacked.mantissa has 3 guard bits (G, R, S)
 
-auto repacked = pack<FP8_E5M2, rounding_policies::ToNearestTiesToEven>(unpacked);
+auto repacked = pack<fp8_e5m2, rounding_policies::ToNearestTiesToEven>(unpacked);
 // Rounding applied based on G, R, S bits
 ```
 

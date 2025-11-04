@@ -8,7 +8,7 @@ A C++20 header-only library for compile-time configurable floating-point arithme
 
 - **Zero Runtime Overhead**: All configuration decisions made at compile time
 - **Universal Scalability**: Same design works on 8-bit microprocessors and ML accelerators
-- **Format Flexibility**: Support for IEEE 754, ML formats (FP8, FP16), and custom formats
+- **Format Flexibility**: Support for IEEE 754, ML formats (fp8, fp16), and custom formats
 - **Policy-Based Design**: Choose exact semantics for rounding, special values, and error handling
 - **Progressive Optimization**: Start with working code, optimize hot paths with assembly later
 - **Cross-Compiler Support**: Works with Clang (with `_BitInt`), GCC, and MSVC
@@ -24,7 +24,7 @@ Standard floating-point libraries assume IEEE 754 compliance, hardware support, 
 - **Type Selection System**: Three policies (ExactWidth, LeastWidth, Fastest) with `_BitInt` support
 - **Format Descriptors**: Arbitrary bit layouts with padding support
 - **Pack/Unpack Operations**: Bidirectional conversion with implicit bit handling
-- **Standard Formats**: fp8, IEEE 754 binary16/32/64
+- **Standard Formats**: fp8_e5m2, fp8_e4m3, fp16_e5m10, fp32_e8m23, fp64_e11m52
 - **Cross-Platform**: Linux, macOS, Windows with GCC, Clang, and MSVC
 - **Comprehensive Tests**: Exhaustive testing for 8-bit formats
 

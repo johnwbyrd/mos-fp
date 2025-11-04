@@ -77,10 +77,12 @@ using IEEE_Format = FormatDescriptor<1,                  // SignBits
                                      TypePolicy>;
 
 // Common format definitions
-using FP8_E5M2 = IEEE_Format<5, 2>;
-using FP8_E4M3 = IEEE_Format<4, 3>;
-using FP16 = IEEE_Format<5, 10>;
-using Binary32 = IEEE_Format<8, 23>;
-using Binary64 = IEEE_Format<11, 52>;
+// Naming convention: fp{total_bits}_e{exp_bits}m{mant_bits}
+// This pattern matches NVIDIA's __nv_fp8_e4m3 convention (without the prefix)
+using fp8_e5m2 = IEEE_Format<5, 2>;
+using fp8_e4m3 = IEEE_Format<4, 3>;
+using fp16_e5m10 = IEEE_Format<5, 10>;   // IEEE 754 binary16 (half precision)
+using fp32_e8m23 = IEEE_Format<8, 23>;   // IEEE 754 binary32 (single precision)
+using fp64_e11m52 = IEEE_Format<11, 52>; // IEEE 754 binary64 (double precision)
 
 } // namespace opine::inline v1

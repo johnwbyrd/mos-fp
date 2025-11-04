@@ -94,20 +94,20 @@ static_assert(std::is_same_v<int_t<32, type_policies::Fastest>, int_fast32_t>,
 
 // Realistic Format Type Aliases
 
-// FP8 E5M2: 1 sign + 5 exponent + 2 mantissa = 8 bits
-using fp8_e5m2_storage = uint_t<8>;
-using fp8_e5m2_exp = uint_t<5>;
-using fp8_e5m2_mant = uint_t<2>;
+// fp8_e5m2: 1 sign + 5 exponent + 2 mantissa = 8 bits
+using fp8_e5m2_storage_t = uint_t<8>;
+using fp8_e5m2_exp_t = uint_t<5>;
+using fp8_e5m2_mant_t = uint_t<2>;
 
-// FP8 E4M3: 1 sign + 4 exponent + 3 mantissa = 8 bits
-using fp8_e4m3_storage = uint_t<8>;
-using fp8_e4m3_exp = uint_t<4>;
-using fp8_e4m3_mant = uint_t<3>;
+// fp8_e4m3: 1 sign + 4 exponent + 3 mantissa = 8 bits
+using fp8_e4m3_storage_t = uint_t<8>;
+using fp8_e4m3_exp_t = uint_t<4>;
+using fp8_e4m3_mant_t = uint_t<3>;
 
-// IEEE 754 Binary32: 1 sign + 8 exponent + 23 mantissa = 32 bits
-using fp32_storage = uint_t<32>;
-using fp32_exp = uint_t<8>;
-using fp32_mant = uint_t<23>;
+// fp32_e8m23: 1 sign + 8 exponent + 23 mantissa = 32 bits
+using fp32_e8m23_storage_t = uint_t<32>;
+using fp32_e8m23_exp_t = uint_t<8>;
+using fp32_e8m23_mant_t = uint_t<23>;
 
 // With guard bits: 23-bit mantissa + 3 guard bits = 26 bits
 using fp32_mant_with_guards = uint_t<26>;
@@ -238,17 +238,17 @@ static_assert(
 
 // Realistic Format Type Verification
 
-static_assert(std::is_same_v<fp8_e5m2_storage, unsigned _BitInt(8)>);
-static_assert(std::is_same_v<fp8_e5m2_exp, unsigned _BitInt(5)>);
-static_assert(std::is_same_v<fp8_e5m2_mant, unsigned _BitInt(2)>);
+static_assert(std::is_same_v<fp8_e5m2_storage_t, unsigned _BitInt(8)>);
+static_assert(std::is_same_v<fp8_e5m2_exp_t, unsigned _BitInt(5)>);
+static_assert(std::is_same_v<fp8_e5m2_mant_t, unsigned _BitInt(2)>);
 
-static_assert(std::is_same_v<fp8_e4m3_storage, unsigned _BitInt(8)>);
-static_assert(std::is_same_v<fp8_e4m3_exp, unsigned _BitInt(4)>);
-static_assert(std::is_same_v<fp8_e4m3_mant, unsigned _BitInt(3)>);
+static_assert(std::is_same_v<fp8_e4m3_storage_t, unsigned _BitInt(8)>);
+static_assert(std::is_same_v<fp8_e4m3_exp_t, unsigned _BitInt(4)>);
+static_assert(std::is_same_v<fp8_e4m3_mant_t, unsigned _BitInt(3)>);
 
-static_assert(std::is_same_v<fp32_storage, unsigned _BitInt(32)>);
-static_assert(std::is_same_v<fp32_exp, unsigned _BitInt(8)>);
-static_assert(std::is_same_v<fp32_mant, unsigned _BitInt(23)>);
+static_assert(std::is_same_v<fp32_e8m23_storage_t, unsigned _BitInt(32)>);
+static_assert(std::is_same_v<fp32_e8m23_exp_t, unsigned _BitInt(8)>);
+static_assert(std::is_same_v<fp32_e8m23_mant_t, unsigned _BitInt(23)>);
 
 static_assert(std::is_same_v<fp32_mant_with_guards, unsigned _BitInt(26)>);
 
@@ -272,7 +272,7 @@ int main() {
   int_t<7, type_policies::Fastest> f = 0;
 
   // Realistic format types
-  fp8_e5m2_storage g = 0;
+  fp8_e5m2_storage_t g = 0;
   fp32_mant_with_guards h = 0;
 
   // Suppress unused variable warnings

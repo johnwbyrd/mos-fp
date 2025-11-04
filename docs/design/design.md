@@ -10,7 +10,7 @@ Modern computing spans an enormous range of platforms and requirements:
 - **Retro computing**: 6502 at 1 MHz, no hardware multiply, 64KB total RAM
 - **Embedded systems**: ARM Cortex-M0 at 48 MHz, hardware multiply, 32KB RAM
 - **ML accelerators**: Custom formats (FP8, FP6, FP4), massive parallelism, specialized hardware
-- **High-end GPUs**: Thousands of cores, mixed precision, native FP8/FP16/FP32 support
+- **High-end GPUs**: Thousands of cores, mixed precision, native fp8/fp16/fp32 support
 
 **Each platform needs different floating point:**
 

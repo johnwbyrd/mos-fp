@@ -16,7 +16,7 @@ namespace opine::test_helpers {
 // - Assumes IEEE 754 binary32 native float
 //
 // Template parameters:
-//   Format: The OPINE format descriptor (e.g., FP8_E5M2)
+//   Format: The OPINE format descriptor (e.g., fp8_e5m2)
 template <typename Format>
 float to_native_float(typename Format::storage_type bits) {
   // Unpack the bits to get sign, exponent, and mantissa

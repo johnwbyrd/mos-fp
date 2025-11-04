@@ -152,17 +152,17 @@ template <typename Format> bool test_tie_cases_specific() {
 }
 
 // Compile-time tests for roundtrip identity
-static_assert(test_roundtrip_identity<FP8_E5M2, rounding_policies::TowardZero>(),
-              "FP8 E5M2 TowardZero: roundtrip identity");
+static_assert(test_roundtrip_identity<fp8_e5m2, rounding_policies::TowardZero>(),
+              "fp8_e5m2 TowardZero: roundtrip identity");
 static_assert(
-    test_roundtrip_identity<FP8_E5M2, rounding_policies::ToNearestTiesToEven>(),
-    "FP8 E5M2 ToNearestTiesToEven: roundtrip identity");
+    test_roundtrip_identity<fp8_e5m2, rounding_policies::ToNearestTiesToEven>(),
+    "fp8_e5m2 ToNearestTiesToEven: roundtrip identity");
 
-static_assert(test_roundtrip_identity<FP8_E4M3, rounding_policies::TowardZero>(),
-              "FP8 E4M3 TowardZero: roundtrip identity");
+static_assert(test_roundtrip_identity<fp8_e4m3, rounding_policies::TowardZero>(),
+              "fp8_e4m3 TowardZero: roundtrip identity");
 static_assert(
-    test_roundtrip_identity<FP8_E4M3, rounding_policies::ToNearestTiesToEven>(),
-    "FP8 E4M3 ToNearestTiesToEven: roundtrip identity");
+    test_roundtrip_identity<fp8_e4m3, rounding_policies::ToNearestTiesToEven>(),
+    "fp8_e4m3 ToNearestTiesToEven: roundtrip identity");
 
 // Runtime tests with oracle
 int main() {
@@ -170,70 +170,70 @@ int main() {
 
   printf("Test 1: Roundtrip Identity (pack(unpack(x)) == x)\n");
   printf("----------------------------------------\n");
-  printf("FP8 E5M2 TowardZero: ");
-  printf("%s\n", test_roundtrip_identity<FP8_E5M2,
+  printf("fp8_e5m2 TowardZero: ");
+  printf("%s\n", test_roundtrip_identity<fp8_e5m2,
                                          rounding_policies::TowardZero>()
                      ? "PASS"
                      : "FAIL");
 
-  printf("FP8 E5M2 ToNearestTiesToEven: ");
+  printf("fp8_e5m2 ToNearestTiesToEven: ");
   printf("%s\n",
-         test_roundtrip_identity<FP8_E5M2,
+         test_roundtrip_identity<fp8_e5m2,
                                  rounding_policies::ToNearestTiesToEven>()
              ? "PASS"
              : "FAIL");
 
-  printf("FP8 E4M3 TowardZero: ");
-  printf("%s\n", test_roundtrip_identity<FP8_E4M3,
+  printf("fp8_e4m3 TowardZero: ");
+  printf("%s\n", test_roundtrip_identity<fp8_e4m3,
                                          rounding_policies::TowardZero>()
                      ? "PASS"
                      : "FAIL");
 
-  printf("FP8 E4M3 ToNearestTiesToEven: ");
+  printf("fp8_e4m3 ToNearestTiesToEven: ");
   printf("%s\n",
-         test_roundtrip_identity<FP8_E4M3,
+         test_roundtrip_identity<fp8_e4m3,
                                  rounding_policies::ToNearestTiesToEven>()
              ? "PASS"
              : "FAIL");
 
   printf("\nTest 2: Native Float Oracle (to_native → from_native roundtrip)\n");
   printf("----------------------------------------\n");
-  printf("FP8 E5M2 TowardZero:\n");
-  bool pass1 = test_native_float_roundtrip<FP8_E5M2,
+  printf("fp8_e5m2 TowardZero:\n");
+  bool pass1 = test_native_float_roundtrip<fp8_e5m2,
                                            rounding_policies::TowardZero>();
   printf("  Result: %s\n", pass1 ? "PASS" : "FAIL");
 
-  printf("\nFP8 E5M2 ToNearestTiesToEven:\n");
+  printf("\nfp8_e5m2 ToNearestTiesToEven:\n");
   bool pass2 =
-      test_native_float_roundtrip<FP8_E5M2,
+      test_native_float_roundtrip<fp8_e5m2,
                                   rounding_policies::ToNearestTiesToEven>();
   printf("  Result: %s\n", pass2 ? "PASS" : "FAIL");
 
-  printf("\nFP8 E4M3 TowardZero:\n");
-  bool pass3 = test_native_float_roundtrip<FP8_E4M3,
+  printf("\nfp8_e4m3 TowardZero:\n");
+  bool pass3 = test_native_float_roundtrip<fp8_e4m3,
                                            rounding_policies::TowardZero>();
   printf("  Result: %s\n", pass3 ? "PASS" : "FAIL");
 
-  printf("\nFP8 E4M3 ToNearestTiesToEven:\n");
+  printf("\nfp8_e4m3 ToNearestTiesToEven:\n");
   bool pass4 =
-      test_native_float_roundtrip<FP8_E4M3,
+      test_native_float_roundtrip<fp8_e4m3,
                                   rounding_policies::ToNearestTiesToEven>();
   printf("  Result: %s\n", pass4 ? "PASS" : "FAIL");
 
   printf("\nTest 3: Rounding Mode Differences\n");
   printf("----------------------------------------\n");
-  printf("FP8 E5M2:\n");
-  test_rounding_differences<FP8_E5M2>();
+  printf("fp8_e5m2:\n");
+  test_rounding_differences<fp8_e5m2>();
 
-  printf("\nFP8 E4M3:\n");
-  test_rounding_differences<FP8_E4M3>();
+  printf("\nfp8_e4m3:\n");
+  test_rounding_differences<fp8_e4m3>();
 
   printf("\nTest 4: Tie-to-Even Specific Cases\n");
   printf("----------------------------------------\n");
-  printf("FP8 E5M2: ");
-  printf("%s\n", test_tie_cases_specific<FP8_E5M2>() ? "PASS" : "FAIL");
-  printf("FP8 E4M3: ");
-  printf("%s\n", test_tie_cases_specific<FP8_E4M3>() ? "PASS" : "FAIL");
+  printf("fp8_e5m2: ");
+  printf("%s\n", test_tie_cases_specific<fp8_e5m2>() ? "PASS" : "FAIL");
+  printf("fp8_e4m3: ");
+  printf("%s\n", test_tie_cases_specific<fp8_e4m3>() ? "PASS" : "FAIL");
 
   bool all_pass = pass1 && pass2 && pass3 && pass4;
   if (all_pass) {

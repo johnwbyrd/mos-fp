@@ -146,51 +146,51 @@ template <typename Format> constexpr bool test_guard_bits_zero() {
 
 // Compile-time tests
 // FP8 E5M2 exhaustive identity test
-static_assert(test_identity_exhaustive<FP8_E5M2>(),
-              "FP8 E5M2: pack(unpack(x)) must equal x for all values");
+static_assert(test_identity_exhaustive<fp8_e5m2>(),
+              "fp8_e5m2: pack(unpack(x)) must equal x for all values");
 
 // FP8 E4M3 exhaustive identity test
-static_assert(test_identity_exhaustive<FP8_E4M3>(),
-              "FP8 E4M3: pack(unpack(x)) must equal x for all values");
+static_assert(test_identity_exhaustive<fp8_e4m3>(),
+              "fp8_e4m3: pack(unpack(x)) must equal x for all values");
 
-// Bit extraction tests for FP8 E5M2
+// Bit extraction tests for fp8_e5m2
 // Format: [S:1][E:5][M:2]
 // Bit pattern: 0b10110011 = 0xB3
 // S=1, E=01100=12, M=11=3
-static_assert(test_bit_extraction<FP8_E5M2>(0xB3, true, 12, 3),
-              "FP8 E5M2: bit extraction test 1");
+static_assert(test_bit_extraction<fp8_e5m2>(0xB3, true, 12, 3),
+              "fp8_e5m2: bit extraction test 1");
 
 // Bit pattern: 0b00000001 = 0x01
 // S=0, E=00000=0, M=01=1
-static_assert(test_bit_extraction<FP8_E5M2>(0x01, false, 0, 1),
-              "FP8 E5M2: bit extraction test 2 (denormal)");
+static_assert(test_bit_extraction<fp8_e5m2>(0x01, false, 0, 1),
+              "fp8_e5m2: bit extraction test 2 (denormal)");
 
 // Bit pattern: 0b01111100 = 0x7C
 // S=0, E=11111=31, M=00=0
-static_assert(test_bit_extraction<FP8_E5M2>(0x7C, false, 31, 0),
-              "FP8 E5M2: bit extraction test 3 (max exp)");
+static_assert(test_bit_extraction<fp8_e5m2>(0x7C, false, 31, 0),
+              "fp8_e5m2: bit extraction test 3 (max exp)");
 
-// Bit extraction tests for FP8 E4M3
+// Bit extraction tests for fp8_e4m3
 // Format: [S:1][E:4][M:3]
 // Bit pattern: 0b10110101 = 0xB5
 // S=1, E=0110=6, M=101=5
-static_assert(test_bit_extraction<FP8_E4M3>(0xB5, true, 6, 5),
-              "FP8 E4M3: bit extraction test 1");
+static_assert(test_bit_extraction<fp8_e4m3>(0xB5, true, 6, 5),
+              "fp8_e4m3: bit extraction test 1");
 
 // Bit pattern: 0b00000111 = 0x07
 // S=0, E=0000=0, M=111=7
-static_assert(test_bit_extraction<FP8_E4M3>(0x07, false, 0, 7),
-              "FP8 E4M3: bit extraction test 2 (denormal)");
+static_assert(test_bit_extraction<fp8_e4m3>(0x07, false, 0, 7),
+              "fp8_e4m3: bit extraction test 2 (denormal)");
 
 // Implicit bit tests
-static_assert(test_implicit_bit<FP8_E5M2>(), "FP8 E5M2: implicit bit handling");
-static_assert(test_implicit_bit<FP8_E4M3>(), "FP8 E4M3: implicit bit handling");
+static_assert(test_implicit_bit<fp8_e5m2>(), "fp8_e5m2: implicit bit handling");
+static_assert(test_implicit_bit<fp8_e4m3>(), "fp8_e4m3: implicit bit handling");
 
 // Guard bits tests
-static_assert(test_guard_bits_zero<FP8_E5M2>(),
-              "FP8 E5M2: guard bits are zero after unpack");
-static_assert(test_guard_bits_zero<FP8_E4M3>(),
-              "FP8 E4M3: guard bits are zero after unpack");
+static_assert(test_guard_bits_zero<fp8_e5m2>(),
+              "fp8_e5m2: guard bits are zero after unpack");
+static_assert(test_guard_bits_zero<fp8_e4m3>(),
+              "fp8_e4m3: guard bits are zero after unpack");
 
 // Padded format test
 // Create a 12-bit format with padding: [pad:3][S:1][E:4][M:3][pad:1]
@@ -212,18 +212,18 @@ static_assert(test_identity_exhaustive<PaddedFormat>(),
 int main() {
   printf("=== OPINE Pack/Unpack Tests ===\n\n");
 
-  // FP8 E5M2 tests
-  printf("FP8 E5M2 exhaustive test: ");
-  if (test_identity_exhaustive<FP8_E5M2>()) {
+  // fp8_e5m2 tests
+  printf("fp8_e5m2 exhaustive test: ");
+  if (test_identity_exhaustive<fp8_e5m2>()) {
     printf("PASS (all 256 values)\n");
   } else {
     printf("FAIL\n");
     return 1;
   }
 
-  // FP8 E4M3 tests
-  printf("FP8 E4M3 exhaustive test: ");
-  if (test_identity_exhaustive<FP8_E4M3>()) {
+  // fp8_e4m3 tests
+  printf("fp8_e4m3 exhaustive test: ");
+  if (test_identity_exhaustive<fp8_e4m3>()) {
     printf("PASS (all 256 values)\n");
   } else {
     printf("FAIL\n");
@@ -231,19 +231,19 @@ int main() {
   }
 
   // Bit extraction tests
-  printf("FP8 E5M2 bit extraction: ");
+  printf("fp8_e5m2 bit extraction: ");
   bool extraction_ok = true;
-  extraction_ok &= test_bit_extraction<FP8_E5M2>(0xB3, true, 12, 3);
-  extraction_ok &= test_bit_extraction<FP8_E5M2>(0x01, false, 0, 1);
-  extraction_ok &= test_bit_extraction<FP8_E5M2>(0x7C, false, 31, 0);
+  extraction_ok &= test_bit_extraction<fp8_e5m2>(0xB3, true, 12, 3);
+  extraction_ok &= test_bit_extraction<fp8_e5m2>(0x01, false, 0, 1);
+  extraction_ok &= test_bit_extraction<fp8_e5m2>(0x7C, false, 31, 0);
   printf("%s\n", extraction_ok ? "PASS" : "FAIL");
   if (!extraction_ok)
     return 1;
 
-  printf("FP8 E4M3 bit extraction: ");
+  printf("fp8_e4m3 bit extraction: ");
   extraction_ok = true;
-  extraction_ok &= test_bit_extraction<FP8_E4M3>(0xB5, true, 6, 5);
-  extraction_ok &= test_bit_extraction<FP8_E4M3>(0x07, false, 0, 7);
+  extraction_ok &= test_bit_extraction<fp8_e4m3>(0xB5, true, 6, 5);
+  extraction_ok &= test_bit_extraction<fp8_e4m3>(0x07, false, 0, 7);
   printf("%s\n", extraction_ok ? "PASS" : "FAIL");
   if (!extraction_ok)
     return 1;
@@ -251,8 +251,8 @@ int main() {
   // Implicit bit tests
   printf("Implicit bit handling: ");
   bool implicit_ok = true;
-  implicit_ok &= test_implicit_bit<FP8_E5M2>();
-  implicit_ok &= test_implicit_bit<FP8_E4M3>();
+  implicit_ok &= test_implicit_bit<fp8_e5m2>();
+  implicit_ok &= test_implicit_bit<fp8_e4m3>();
   printf("%s\n", implicit_ok ? "PASS" : "FAIL");
   if (!implicit_ok)
     return 1;
@@ -260,8 +260,8 @@ int main() {
   // Guard bits tests
   printf("Guard bits zero check: ");
   bool guard_ok = true;
-  guard_ok &= test_guard_bits_zero<FP8_E5M2>();
-  guard_ok &= test_guard_bits_zero<FP8_E4M3>();
+  guard_ok &= test_guard_bits_zero<fp8_e5m2>();
+  guard_ok &= test_guard_bits_zero<fp8_e4m3>();
   printf("%s\n", guard_ok ? "PASS" : "FAIL");
   if (!guard_ok)
     return 1;

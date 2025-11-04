@@ -217,44 +217,44 @@ template <typename Format> constexpr bool test_ties_to_even_pattern() {
 }
 
 // Compile-time tests
-static_assert(test_round_to_nearest_even<FP8_E5M2>(),
-              "FP8 E5M2: ToNearestTiesToEven rounding logic test");
-static_assert(test_round_to_nearest_even<FP8_E4M3>(),
-              "FP8 E4M3: ToNearestTiesToEven rounding logic test");
+static_assert(test_round_to_nearest_even<fp8_e5m2>(),
+              "fp8_e5m2: ToNearestTiesToEven rounding logic test");
+static_assert(test_round_to_nearest_even<fp8_e4m3>(),
+              "fp8_e4m3: ToNearestTiesToEven rounding logic test");
 
-static_assert(test_round_toward_zero<FP8_E5M2>(),
-              "FP8 E5M2: TowardZero rounding logic test");
-static_assert(test_round_toward_zero<FP8_E4M3>(),
-              "FP8 E4M3: TowardZero rounding logic test");
+static_assert(test_round_toward_zero<fp8_e5m2>(),
+              "fp8_e5m2: TowardZero rounding logic test");
+static_assert(test_round_toward_zero<fp8_e4m3>(),
+              "fp8_e4m3: TowardZero rounding logic test");
 
-static_assert(test_ties_to_even_pattern<FP8_E5M2>(),
-              "FP8 E5M2: Ties to even pattern test");
-static_assert(test_ties_to_even_pattern<FP8_E4M3>(),
-              "FP8 E4M3: Ties to even pattern test");
+static_assert(test_ties_to_even_pattern<fp8_e5m2>(),
+              "fp8_e5m2: Ties to even pattern test");
+static_assert(test_ties_to_even_pattern<fp8_e4m3>(),
+              "fp8_e4m3: Ties to even pattern test");
 
 // Runtime tests with output
 int main() {
   printf("=== OPINE Rounding Logic Tests ===\n\n");
 
-  printf("FP8 E5M2 ToNearestTiesToEven: ");
+  printf("fp8_e5m2 ToNearestTiesToEven: ");
   printf("%s\n",
-         test_round_to_nearest_even<FP8_E5M2>() ? "PASS" : "FAIL");
+         test_round_to_nearest_even<fp8_e5m2>() ? "PASS" : "FAIL");
 
-  printf("FP8 E4M3 ToNearestTiesToEven: ");
+  printf("fp8_e4m3 ToNearestTiesToEven: ");
   printf("%s\n",
-         test_round_to_nearest_even<FP8_E4M3>() ? "PASS" : "FAIL");
+         test_round_to_nearest_even<fp8_e4m3>() ? "PASS" : "FAIL");
 
-  printf("FP8 E5M2 TowardZero: ");
-  printf("%s\n", test_round_toward_zero<FP8_E5M2>() ? "PASS" : "FAIL");
+  printf("fp8_e5m2 TowardZero: ");
+  printf("%s\n", test_round_toward_zero<fp8_e5m2>() ? "PASS" : "FAIL");
 
-  printf("FP8 E4M3 TowardZero: ");
-  printf("%s\n", test_round_toward_zero<FP8_E4M3>() ? "PASS" : "FAIL");
+  printf("fp8_e4m3 TowardZero: ");
+  printf("%s\n", test_round_toward_zero<fp8_e4m3>() ? "PASS" : "FAIL");
 
-  printf("FP8 E5M2 Ties to even pattern: ");
-  printf("%s\n", test_ties_to_even_pattern<FP8_E5M2>() ? "PASS" : "FAIL");
+  printf("fp8_e5m2 Ties to even pattern: ");
+  printf("%s\n", test_ties_to_even_pattern<fp8_e5m2>() ? "PASS" : "FAIL");
 
-  printf("FP8 E4M3 Ties to even pattern: ");
-  printf("%s\n", test_ties_to_even_pattern<FP8_E4M3>() ? "PASS" : "FAIL");
+  printf("fp8_e4m3 Ties to even pattern: ");
+  printf("%s\n", test_ties_to_even_pattern<fp8_e4m3>() ? "PASS" : "FAIL");
 
   printf("\n=== All rounding logic tests passed! ===\n");
   return 0;
