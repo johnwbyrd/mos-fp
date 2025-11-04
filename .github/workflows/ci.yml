@@ -55,7 +55,7 @@ jobs:
     - name: Setup Clang (Windows)
       if: matrix.os == 'windows-latest' && matrix.compiler == 'clang'
       run: |
-        choco install llvm --version=18.1.8 -y
+        choco install llvm -y
         echo "CC=clang" >> $env:GITHUB_ENV
         echo "CXX=clang++" >> $env:GITHUB_ENV
         # Add LLVM to PATH
