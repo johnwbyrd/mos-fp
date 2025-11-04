@@ -17,9 +17,32 @@ A C++20 header-only library for compile-time configurable floating-point arithme
 
 Standard floating-point libraries assume IEEE 754 compliance, hardware support, and one-size-fits-all semantics. None of these hold universally. OPINE separates *what* (format and behavior) from *how* (implementation), generating exactly the code you need through compile-time policies.
 
+## Philosophy: Compose Any Behavior You Need
+
+**OPINE is a composition system, not a fixed library.** We provide common, well-tested policy combinations (like IEEE 754 binary32), but the architecture allows you to compose any combination of policies that makes sense for your use case.
+
+Every aspect of floating-point arithmetic that varies across applications is expressed as an independent policy dimension:
+
+- **Precision**: How many bits? (8-bit FP8, 16-bit, 32-bit, arbitrary custom formats)
+- **Rounding**: Which direction? (nearest-even, toward-zero, toward-±∞, stochastic, custom)
+- **Special values**: What exists? (NaN? Infinity? Denormals? All? None? Mix?)
+- **Error handling**: How to fail? (silent, saturate, trap, compile error)
+- **Implementation**: What code? (portable C++, inline assembly, ROM calls, hardware intrinsics)
+- **Type selection**: What integer widths? (exact `_BitInt`, least-width, fastest)
+
+**These dimensions are orthogonal by design.** You can combine any rounding policy with any special value handling with any error handling strategy. Want round-to-zero with no denormals but with NaN? Compose it. Want IEEE 754 except flush denormals to zero? Compose it. Want to match specific GPU hardware behavior? Compose the policies that match.
+
+### The Core Principle
+
+**Your floating-point needs are unique. OPINE lets you express them precisely.**
+
+We provide proven policy combinations (IEEE 754 formats, common ML formats), but you're not limited to these. Compose policies freely to match your hardware, your accuracy requirements, your performance constraints, or your compatibility needs.
+
+When you ask "how does OPINE handle X?", the answer is: "however the policy you compose says to handle it." OPINE provides the composition mechanism and the policy building blocks—you decide the behavior.
+
 ## Current Status
 
-### Implemented ✓
+### Implemented
 
 - **Type Selection System**: Three policies (ExactWidth, LeastWidth, Fastest) with `_BitInt` support
 - **Format Descriptors**: Arbitrary bit layouts with padding support
@@ -28,7 +51,7 @@ Standard floating-point libraries assume IEEE 754 compliance, hardware support, 
 - **Cross-Platform**: Linux, macOS, Windows with GCC, Clang, and MSVC
 - **Comprehensive Tests**: Exhaustive testing for 8-bit formats
 
-### Planned 🚧
+### Planned
 
 - Arithmetic operations (add, subtract, multiply, divide)
 - Rounding policies (ToNearest, TowardZero, TowardPositive, TowardNegative)
@@ -80,23 +103,9 @@ opine/
 └── docs/design/            # Design documentation
 ```
 
-## Philosophy
+## Implementation Notes
 
-### Perpendicular Concerns
-
-OPINE abstracts floating-point operations into independent, configurable concerns. Each programmer's needs should not affect other programmers—each gets an optimal library doing only the math they need, and no more.
-
-The configurable dimensions:
-
-- **Precision**: How many bits? Ability to shortchange precision is a *feature*, not a bug
-- **Rounding**: Nearest, zero, positive, negative, or custom modes
-- **Special values**: NaN, Infinity, denormals—enable only what you need
-- **Error handling**: Silent, exceptions, status flags, or compile errors
-- **Implementation**: Generic C++, platform assembly, ROM calls, or hardware instructions
-
-**The key principle**: Your rounding requirements don't bloat my binary. Your error handling doesn't slow down my tight loops. Your hardware features don't force complexity on my 8-bit system.
-
-All decisions made at compile time. Zero runtime cost. Zero interference between use cases.
+All policy decisions are made at compile time through template instantiation. Zero runtime overhead. Zero interference between different policy compositions used in the same program.
 
 ## License
 
