@@ -17,33 +17,6 @@ A C++20 header-only library for compile-time configurable floating-point arithme
 
 Standard floating-point libraries assume IEEE 754 compliance, hardware support, and one-size-fits-all semantics. None of these hold universally. OPINE separates *what* (format and behavior) from *how* (implementation), generating exactly the code you need through compile-time policies.
 
-## Quick Example
-
-```cpp
-#include <opine/opine.hpp>
-
-using namespace opine;
-
-// FP8 E5M2 format: 1 sign + 5 exponent + 2 mantissa bits
-// Works on any platform, generates optimal code for each
-
-void particle_update() {
-  // Storage uses uint8_t
-  FP8_E5M2::storage_type pos = pack<FP8_E5M2>({0, 15, 1});  // 1.0
-  FP8_E5M2::storage_type vel = pack<FP8_E5M2>({0, 14, 2});  // 0.5
-
-  // Unpack for computation
-  auto pos_unpacked = unpack<FP8_E5M2>(pos);
-  auto vel_unpacked = unpack<FP8_E5M2>(vel);
-
-  // Operations happen on unpacked representation
-  // (multiply/add coming soon)
-
-  // Pack back to storage
-  pos = pack<FP8_E5M2>(pos_unpacked);
-}
-```
-
 ## Current Status
 
 ### Implemented ✓
@@ -51,7 +24,7 @@ void particle_update() {
 - **Type Selection System**: Three policies (ExactWidth, LeastWidth, Fastest) with `_BitInt` support
 - **Format Descriptors**: Arbitrary bit layouts with padding support
 - **Pack/Unpack Operations**: Bidirectional conversion with implicit bit handling
-- **Standard Formats**: FP8 E5M2, FP8 E4M3, IEEE 754 binary16/32/64
+- **Standard Formats**: fp8, IEEE 754 binary16/32/64
 - **Cross-Platform**: Linux, macOS, Windows with GCC, Clang, and MSVC
 - **Comprehensive Tests**: Exhaustive testing for 8-bit formats
 
@@ -109,17 +82,21 @@ opine/
 
 ## Philosophy
 
-The primitive mathematical operations of addition, subtraction, multiply, and divide have a lot of flexibility in how they are implemented for floating point formats.  There are many trade-offs between accuracy and speed, depending on the target architecture.
+### Perpendicular Concerns
 
-OPINE embraces this reality. Instead of forcing one set of semantics, it lets you choose:
+OPINE abstracts floating-point operations into independent, configurable concerns. Each programmer's needs should not affect other programmers—each gets an optimal library doing only the math they need, and no more.
 
-- **Format**: How many bits for sign, exponent, mantissa
-- **Rounding**: Nearest, zero, positive, negative, or custom
+The configurable dimensions:
+
+- **Precision**: How many bits? Ability to shortchange precision is a *feature*, not a bug
+- **Rounding**: Nearest, zero, positive, negative, or custom modes
 - **Special values**: NaN, Infinity, denormals—enable only what you need
 - **Error handling**: Silent, exceptions, status flags, or compile errors
-- **Implementation**: Generic C++, assembly, ROM calls, or hardware ops
+- **Implementation**: Generic C++, platform assembly, ROM calls, or hardware instructions
 
-All decisions are made at compile time.  If you don't need it, then it doesn't exist.
+**The key principle**: Your rounding requirements don't bloat my binary. Your error handling doesn't slow down my tight loops. Your hardware features don't force complexity on my 8-bit system.
+
+All decisions made at compile time. Zero runtime cost. Zero interference between use cases.
 
 ## License
 
