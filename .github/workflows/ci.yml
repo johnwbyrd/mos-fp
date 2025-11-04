@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        compiler: [gcc, clang]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup GCC (Linux)
+      if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'gcc'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y g++-13
+        echo "CC=gcc-13" >> $GITHUB_ENV
+        echo "CXX=g++-13" >> $GITHUB_ENV
+
+    - name: Setup Clang (Linux)
+      if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'clang'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-18
+        echo "CC=clang-18" >> $GITHUB_ENV
+        echo "CXX=clang++-18" >> $GITHUB_ENV
+
+    - name: Setup GCC (macOS)
+      if: matrix.os == 'macos-latest' && matrix.compiler == 'gcc'
+      run: |
+        brew install gcc@13
+        echo "CC=gcc-13" >> $GITHUB_ENV
+        echo "CXX=g++-13" >> $GITHUB_ENV
+
+    - name: Setup Clang (macOS)
+      if: matrix.os == 'macos-latest' && matrix.compiler == 'clang'
+      run: |
+        # macOS comes with clang, but let's use the latest
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "CXX=clang++" >> $GITHUB_ENV
+
+    - name: Setup Clang (Windows)
+      if: matrix.os == 'windows-latest' && matrix.compiler == 'clang'
+      run: |
+        choco install llvm --version=18.1.8 -y
+        echo "CC=clang" >> $env:GITHUB_ENV
+        echo "CXX=clang++" >> $env:GITHUB_ENV
+        # Add LLVM to PATH
+        echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
+    - name: Setup GCC (Windows)
+      if: matrix.os == 'windows-latest' && matrix.compiler == 'gcc'
+      run: |
+        # Use MinGW-w64 GCC
+        choco install mingw -y
+        echo "CC=gcc" >> $env:GITHUB_ENV
+        echo "CXX=g++" >> $env:GITHUB_ENV
+
+    - name: Display compiler version
+      run: |
+        ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }} --version
+        cmake --version
+
+    - name: Configure CMake
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Run tests
+      working-directory: build
+      run: ctest --output-on-failure -C Release
+
+    - name: Display test results
+      if: always()
+      working-directory: build
+      run: |
+        echo "Test results for ${{ matrix.os }} / ${{ matrix.compiler }}:"
+        ctest --output-on-failure -C Release || true
