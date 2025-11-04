@@ -1,6 +1,9 @@
 ; ===========================================================================
 ; mulsf3.s - Optimized IEEE 754 Single-Precision Multiplication for LLVM-MOS
 ; ===========================================================================
+;
+; WARNING! This code is extremely unlikely to be correct as currently written.
+; DO NOT USE IT FOR ANY PURPOSE except purely pedagogical ones.
 ; 
 ; float __mulsf3(float a, float b)
 ;
