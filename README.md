@@ -107,3 +107,11 @@ MIT License - See [LICENSE](LICENSE) for details.
 OPINE is in active development. The core infrastructure (types, formats, pack/unpack) is stable. Arithmetic operations are next.
 
 Contributions welcome! Please see design docs for architectural principles.
+
+# Further reading
+
+https://www.vinc17.net/research/fptest.en.html
+https://people.math.sc.edu/Burkardt/c_src/paranoia/paranoia.html
+https://randomascii.wordpress.com/2012/02/25/comparing-floating-point-numbers-2012-edition/
+https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
+
